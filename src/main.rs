@@ -1,12 +1,16 @@
+mod identities;
 mod input;
 mod output;
 
-use input::{DAY, Map, Row, SHARDS, Table, WEEK, fields, hash_bytes, shard, timestamp, transpose, unsigned, worker_map};
+use identities::Identities;
+use input::{DAY, Map, SHARDS, Table, WEEK, fields, first_field, hash_bytes, mix, shard, timestamp, transpose, unsigned, worker_map};
 use std::collections::hash_map::Entry;
 use std::env;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Instant;
 
 const SESSION_GAP: i64 = 30 * 60_000;
@@ -33,76 +37,6 @@ impl Window {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "empty manifest window"));
         }
         Ok(Self { start, end })
-    }
-}
-
-struct Identities<'a> {
-    index: Map<&'a [u8], u32>,
-    names: Vec<&'a [u8]>,
-}
-
-struct Components<'a> {
-    index: Map<&'a [u8], u32>,
-    parent: Vec<u32>,
-    size: Vec<u32>,
-    names: Vec<&'a [u8]>,
-}
-
-impl<'a> Components<'a> {
-    fn intern(&mut self, name: &'a [u8]) -> u32 {
-        *self.index.entry(name).or_insert_with(|| {
-            let id = self.parent.len() as u32;
-            self.parent.push(id);
-            self.size.push(1);
-            self.names.push(name);
-            id
-        })
-    }
-
-    fn root(&mut self, mut id: u32) -> u32 {
-        while self.parent[id as usize] != id {
-            let parent = self.parent[id as usize] as usize;
-            self.parent[id as usize] = self.parent[parent];
-            id = self.parent[id as usize];
-        }
-        id
-    }
-
-    fn link(&mut self, a: &'a [u8], b: &'a [u8]) {
-        let a = self.intern(a);
-        let b = self.intern(b);
-        let (mut a, mut b) = (self.root(a) as usize, self.root(b) as usize);
-        if a == b { return; }
-        if self.size[a] < self.size[b] {
-            std::mem::swap(&mut a, &mut b);
-        }
-        self.parent[b] = a as u32;
-        self.size[a] += self.size[b];
-        self.names[a] = self.names[a].min(self.names[b]);
-    }
-}
-
-impl<'a> Identities<'a> {
-    fn read(table: &'a Table) -> Self {
-        let mut groups = Components {
-            index: Map::default(), parent: vec![], size: vec![], names: vec![],
-        };
-        for row in table.rows() {
-            if let Some([a, b]) = fields(row) {
-                if !a.is_empty() && !b.is_empty() {
-                    groups.link(a, b);
-                }
-            }
-        }
-        let names = (0..groups.parent.len()).map(|id| {
-            let root = groups.root(id as u32);
-            groups.names[root as usize]
-        }).collect();
-        Self { index: groups.index, names }
-    }
-
-    fn name(&self, key: &'a [u8]) -> &'a [u8] {
-        self.index.get(key).map_or(key, |&id| self.names[id as usize])
     }
 }
 
@@ -141,6 +75,7 @@ struct Event {
     category: u32,
 }
 
+#[derive(Clone, Copy)]
 struct EventRow<'a> { user: &'a [u8], event: Event }
 
 #[derive(Clone, Copy)]
@@ -150,80 +85,272 @@ struct Click<'a> {
     campaign: u32,
 }
 
+#[derive(Clone, Copy)]
 struct ClickRow<'a> { user: &'a [u8], click: Click<'a> }
 
-// For F1 (fixed-width UTC seconds), byte order is chronological order.
-struct Winner<'a> { row: Row, ingest: &'a [u8] }
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Key<'a> { hash: u64, id: &'a [u8] }
+
+impl<'a> Key<'a> {
+    fn new(id: &'a [u8]) -> Self { Self { hash: hash_bytes(id), id } }
+}
+
+impl Hash for Key<'_> {
+    fn hash<H: Hasher>(&self, hasher: &mut H) { hasher.write_u64(self.hash); }
+}
+
+struct EarlyCopy<'a> { ingest: i64, row: EventRow<'a> }
+
+// A table-specific prefix followed by at most eight bytes fits losslessly into
+// u64. Trailing NUL values use the fallback since zero is the padding byte.
+#[inline]
+fn packed_key(id: &[u8], prefix: u8) -> Option<u64> {
+    if !(2..=9).contains(&id.len()) || id[0] != prefix || id[id.len() - 1] == 0 {
+        return None;
+    }
+    let tail = &id[1..];
+    if let Ok(bytes) = tail.try_into() {
+        return Some(u64::from_le_bytes(bytes));
+    }
+    let mut bytes = [0; 8];
+    bytes[..tail.len()].copy_from_slice(tail);
+    Some(u64::from_le_bytes(bytes))
+}
+
+struct Partitions<K, V> {
+    packed: Vec<Vec<(u64, V)>>,
+    fallback: Vec<Vec<(K, V)>>,
+}
+
+impl<K, V> Partitions<K, V> {
+    fn new() -> Self {
+        Self {
+            packed: (0..SHARDS).map(|_| Vec::new()).collect(),
+            fallback: (0..SHARDS).map(|_| Vec::new()).collect(),
+        }
+    }
+}
+
+enum ExactKey<'a> { Packed(u64), Full(Key<'a>) }
+
+impl<'a> ExactKey<'a> {
+    fn new(id: &'a [u8], prefix: u8) -> Self {
+        packed_key(id, prefix).map_or_else(|| Self::Full(Key::new(id)), Self::Packed)
+    }
+
+    fn fingerprint(&self) -> u64 {
+        let hash = match self {
+            Self::Packed(key) => mix(0, *key),
+            Self::Full(key) => key.hash,
+        };
+        hash ^ (hash >> 33)
+    }
+}
+
+impl<'a, V> Partitions<Key<'a>, V> {
+    fn push(&mut self, key: ExactKey<'a>, bucket: usize, value: V) {
+        match key {
+            ExactKey::Packed(key) => self.packed[bucket].push((key, value)),
+            ExactKey::Full(key) => self.fallback[bucket].push((key, value)),
+        }
+    }
+}
+
+fn dedup_jobs<K, V>(workers: Vec<Partitions<K, V>>) -> Vec<Mutex<(Vec<Vec<(u64, V)>>, Vec<Vec<(K, V)>>)>> {
+    let (packed, fallback): (Vec<_>, Vec<_>) = workers.into_iter().map(|worker| (worker.packed, worker.fallback)).unzip();
+    transpose(packed).into_iter().zip(transpose(fallback)).map(Mutex::new).collect()
+}
+
+struct Candidates<'a, V, R> {
+    duplicates: Partitions<Key<'a>, V>,
+    output: Vec<Vec<R>>,
+}
+
+impl<'a, V, R> Candidates<'a, V, R> {
+    fn new() -> Self { Self { duplicates: Partitions::new(), output: buckets() } }
+}
+
+fn buckets<T>() -> Vec<Vec<T>> { (0..SHARDS).map(|_| Vec::new()).collect() }
+
+struct DuplicateFilter { collisions: Vec<Vec<u64>> }
+
+impl DuplicateFilter {
+    fn build(table: &Table, prefix: u8, threads: usize) -> Self {
+        let hashes = transpose(table.scan(threads, buckets, |worker, line| {
+            if let Some(id) = first_field(line) {
+                let hash = ExactKey::new(id, prefix).fingerprint();
+                worker[shard(hash)].push(hash as u32);
+            }
+        }));
+        let results = worker_map(threads, hashes.len(), Vec::new, |worker, index| {
+            let hashes = &hashes[index];
+            let count = hashes.iter().map(Vec::len).sum::<usize>();
+            let mut repeated = vec![];
+            if count > 1 {
+                // The first pass can produce false positives from hash collisions or
+                // malformed rows. All repeated IDs necessarily share a bit, so a
+                // clear collision bit proves that the ID has at most one candidate.
+                let bits = (count * 12).next_power_of_two().max(64);
+                repeated = vec![0; bits / 64];
+                let mut seen = vec![0u64; bits / 64];
+                for &hash in hashes.iter().flatten() {
+                    let slot = (hash as usize) & (bits - 1);
+                    let word = slot >> 6;
+                    let mask = 1u64 << (slot & 63);
+                    repeated[word] |= seen[word] & mask;
+                    seen[word] |= mask;
+                }
+            }
+            worker.push((index, repeated));
+        });
+        let mut collisions = buckets();
+        for (index, repeated) in results.into_iter().flatten() {
+            collisions[index] = repeated;
+        }
+        Self { collisions }
+    }
+
+    fn maybe_repeated(&self, bucket: usize, fingerprint: u64) -> bool {
+        let bits = &self.collisions[bucket];
+        if bits.is_empty() { return false; }
+        let slot = (fingerprint as u32 as usize) & (bits.len() * 64 - 1);
+        bits[slot >> 6] & (1 << (slot & 63)) != 0
+    }
+}
+
+fn prepare_event<'a>(
+    line: &'a [u8], identities: &Identities<'a>, catalog: &Catalog<'a>, window: Window,
+) -> Option<(&'a [u8], EarlyCopy<'a>)> {
+    let [id, user, at, ingest, kind, product, price] = fields(line)?;
+    if id.is_empty() { return None; }
+    let ingest = timestamp(ingest)?;
+    // Invalid copies remain in the dedup stage as tombstones. In particular,
+    // a valid later copy must never rescue an invalid earliest copy.
+    let row = prepare_event_row(user, at, ingest, kind, product, price, identities, catalog, window)
+        .unwrap_or(EventRow { user: b"", event: Event { at: 0, price: 0, category: 0 } });
+    Some((id, EarlyCopy { ingest, row }))
+}
+
+fn prepare_event_row<'a>(
+    user: &'a [u8], at: &[u8], ingest: i64, kind: &[u8], product: &[u8], price: &[u8],
+    identities: &Identities<'a>, catalog: &Catalog<'a>, window: Window,
+) -> Option<EventRow<'a>> {
+    if user.is_empty() || product.is_empty() || !matches!(kind, b"purchase" | b"cart" | b"view") {
+        return None;
+    }
+    let at = timestamp(at).filter(|&at| at >= window.start && at < window.end && ingest - at <= DAY)?;
+    let (price, category) = if kind == b"purchase" {
+        let price = unsigned(price).filter(|&value| (1..=10_000_000).contains(&value))?;
+        let category = catalog.products.get(product).copied().unwrap_or(catalog.unknown);
+        (price as u32, category)
+    } else {
+        (0, 0)
+    };
+    Some(EventRow { user: identities.name(user), event: Event { at, price, category } })
+}
 
 fn load_events<'a>(
     table: &'a Table, identities: &Identities<'a>, catalog: &Catalog<'a>,
     window: Window, threads: usize,
 ) -> Vec<Vec<Vec<EventRow<'a>>>> {
     let stage = Instant::now();
-    let parts = table.partition(threads);
-    eprintln!("partition event IDs    {:.3}s", stage.elapsed().as_secs_f64());
+    let filter = DuplicateFilter::build(table, b'e', threads);
+    eprintln!("event duplicate filter {:.3}s", stage.elapsed().as_secs_f64());
     let stage = Instant::now();
-    let workers = worker_map(threads, parts.len(), || (0..SHARDS).map(|_| Vec::new()).collect::<Vec<_>>(), |loaded, index| {
-        let parts = &parts[index];
-        let count = parts.iter().map(Vec::len).sum::<usize>();
-        let mut winners = Map::with_capacity_and_hasher(count, Default::default());
-        for &row in parts.iter().flatten() {
-            if let Some([id, _, _, ingest, _, _, _]) = fields(table.line(row)) {
-                match winners.entry(id) {
-                    Entry::Vacant(entry) => { entry.insert(Winner { row, ingest }); }
-                    Entry::Occupied(mut entry) if ingest < entry.get().ingest => {
-                        entry.insert(Winner { row, ingest });
-                    }
-                    Entry::Occupied(_) => {}
-                }
+    let workers = table.scan(threads, Candidates::new, |worker, line| {
+        if let Some((id, candidate)) = prepare_event(line, identities, catalog, window) {
+            let key = ExactKey::new(id, b'e');
+            let hash = key.fingerprint();
+            let bucket = shard(hash);
+            if filter.maybe_repeated(bucket, hash) {
+                worker.duplicates.push(key, bucket, candidate);
+            } else if !candidate.row.user.is_empty() {
+                let row = candidate.row;
+                worker.output[shard(hash_bytes(row.user))].push(row);
             }
-        }
-        // Visit winners in file order for reuse of the input pages. On generated data
-        // IDs are random, so iteration through the hash table would jump across files.
-        let mut winners: Vec<_> = winners.into_values().map(|winner| winner.row).collect();
-        winners.sort_unstable_by_key(|row| row.location);
-        for row in winners {
-            let Some([_, user, at, ingest, kind, product, price]) = fields(table.line(row)) else { continue };
-            if user.is_empty() || product.is_empty() || !matches!(kind, b"purchase" | b"cart" | b"view") {
-                continue;
-            }
-            let Some(at) = timestamp(at).filter(|&at| at >= window.start && at < window.end) else { continue };
-            let Some(ingest) = timestamp(ingest) else { continue };
-            if ingest - at > DAY { continue; }
-            let (price, category) = if kind == b"purchase" {
-                let Some(price) = unsigned(price).filter(|&value| (1..=10_000_000).contains(&value)) else { continue };
-                let category = catalog.products.get(product).copied().unwrap_or(catalog.unknown);
-                (price as u32, category)
-            } else {
-                (0, 0)
-            };
-            let user = identities.name(user);
-            loaded[shard(hash_bytes(user))].push(EventRow { user, event: Event { at, price, category } });
         }
     });
-    eprintln!("dedup and validate     {:.3}s", stage.elapsed().as_secs_f64());
-    transpose(workers)
+    let (parts, mut output): (Vec<_>, Vec<_>) = workers.into_iter().map(|worker| (worker.duplicates, worker.output)).unzip();
+    let parts = dedup_jobs(parts);
+    eprintln!("parse/partition events {:.3}s", stage.elapsed().as_secs_f64());
+    let stage = Instant::now();
+    let workers = worker_map(threads, parts.len(), || (0..SHARDS).map(|_| Vec::new()).collect::<Vec<_>>(), |loaded, index| {
+        let (packed, fallback) = std::mem::take(&mut *parts[index].lock().unwrap());
+        select_events(packed, loaded);
+        select_events(fallback, loaded);
+    });
+    eprintln!("dedup/reroute events   {:.3}s", stage.elapsed().as_secs_f64());
+    output.extend(workers);
+    transpose(output)
+}
+
+fn select_events<'a, K: Hash + Eq + Copy>(parts: Vec<Vec<(K, EarlyCopy<'a>)>>, loaded: &mut [Vec<EventRow<'a>>]) {
+    let count = parts.iter().map(Vec::len).sum::<usize>();
+    let mut winners = Map::with_capacity_and_hasher(count, Default::default());
+    for (key, candidate) in parts.iter().flatten() {
+        match winners.entry(*key) {
+            Entry::Vacant(entry) => { entry.insert(candidate); }
+            Entry::Occupied(mut entry) if candidate.ingest < entry.get().ingest => { entry.insert(candidate); }
+            Entry::Occupied(_) => {}
+        }
+    }
+    for winner in winners.into_values() {
+        let row = winner.row;
+        if !row.user.is_empty() {
+            loaded[shard(hash_bytes(row.user))].push(row);
+        }
+    }
+}
+
+fn prepare_click<'a>(
+    line: &'a [u8], identities: &Identities<'a>, catalog: &Catalog<'a>, window: Window,
+) -> Option<(&'a [u8], ClickRow<'a>)> {
+    let [id, user, campaign, at] = fields(line)?;
+    if id.is_empty() || user.is_empty() { return None; }
+    let campaign = *catalog.campaigns.get(campaign)?;
+    let at = timestamp(at).filter(|&at| at >= window.start - WEEK && at < window.end)?;
+    let user = identities.name(user);
+    Some((id, ClickRow { user, click: Click { at, id, campaign } }))
 }
 
 fn load_clicks<'a>(
     table: &'a Table, identities: &Identities<'a>, catalog: &Catalog<'a>,
     window: Window, threads: usize,
 ) -> Vec<Vec<Vec<ClickRow<'a>>>> {
-    let parts = table.partition(threads);
-    let workers = worker_map(threads, parts.len(), || (0..SHARDS).map(|_| Vec::new()).collect::<Vec<_>>(), |loaded, index| {
-        let parts = &parts[index];
-        let count = parts.iter().map(Vec::len).sum::<usize>();
-        let mut seen = Map::with_capacity_and_hasher(count, Default::default());
-        for &row in parts.iter().flatten() {
-            let Some([id, user, campaign, at]) = fields(table.line(row)) else { continue };
-            if seen.insert(id, ()).is_some() || user.is_empty() { continue; }
-            let Some(&campaign) = catalog.campaigns.get(campaign) else { continue };
-            let Some(at) = timestamp(at).filter(|&at| at >= window.start - WEEK && at < window.end) else { continue };
-            let user = identities.name(user);
-            loaded[shard(hash_bytes(user))].push(ClickRow { user, click: Click { at, id, campaign } });
+    let filter = DuplicateFilter::build(table, b'k', threads);
+    let workers = table.scan(threads, Candidates::new, |worker, line| {
+        if let Some((id, row)) = prepare_click(line, identities, catalog, window) {
+            let key = ExactKey::new(id, b'k');
+            let hash = key.fingerprint();
+            let bucket = shard(hash);
+            if filter.maybe_repeated(bucket, hash) {
+                worker.duplicates.push(key, bucket, row);
+            } else {
+                worker.output[shard(hash_bytes(row.user))].push(row);
+            }
         }
     });
-    transpose(workers)
+    let (parts, mut output): (Vec<_>, Vec<_>) = workers.into_iter().map(|worker| (worker.duplicates, worker.output)).unzip();
+    let parts = dedup_jobs(parts);
+    let workers = worker_map(threads, parts.len(), || (0..SHARDS).map(|_| Vec::new()).collect::<Vec<_>>(), |loaded, index| {
+        let (packed, fallback) = std::mem::take(&mut *parts[index].lock().unwrap());
+        select_clicks(packed, loaded);
+        select_clicks(fallback, loaded);
+    });
+    output.extend(workers);
+    transpose(output)
+}
+
+fn select_clicks<'a, K: Hash + Eq>(parts: Vec<Vec<(K, ClickRow<'a>)>>, loaded: &mut [Vec<ClickRow<'a>>]) {
+    let count = parts.iter().map(Vec::len).sum::<usize>();
+    let mut seen = Map::with_capacity_and_hasher(count, Default::default());
+    // Duplicate click copies are identical. Filtering before this set is
+    // equivalent to filtering the surviving copy.
+    for (key, row) in parts.into_iter().flatten() {
+        if seen.insert(key, ()).is_none() {
+            loaded[shard(hash_bytes(row.user))].push(row);
+        }
+    }
 }
 
 #[derive(Default)]

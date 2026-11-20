@@ -11,7 +11,6 @@ use std::thread;
 pub const DAY: i64 = 86_400_000;
 pub const WEEK: i64 = 7 * DAY;
 pub const SHARDS: usize = 128;
-const FILE_SHIFT: u32 = 48;
 
 unsafe extern "C" {
     fn mmap(address: *mut c_void, len: usize, protection: i32, flags: i32, fd: i32, offset: i64) -> *mut c_void;
@@ -82,7 +81,22 @@ fn unquote(cell: &[u8]) -> Option<&[u8]> {
 }
 
 #[inline]
+pub fn first_field(line: &[u8]) -> Option<&[u8]> {
+    let comma = find(line, b',')?;
+    unquote(&line[..comma]).filter(|id| !id.is_empty())
+}
+
+#[inline]
 pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
+    #[cfg(target_arch = "x86_64")]
+    if (16..=128).contains(&line.len()) {
+        return scanned_fields(line);
+    }
+    scalar_fields(line)
+}
+
+#[inline]
+fn scalar_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     let mut values = [b"".as_slice(); N];
     let mut rest = line;
     for value in &mut values[..N - 1] {
@@ -97,10 +111,55 @@ pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     Some(values)
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct Row {
-    pub hash: u64,
-    pub location: u64,
+#[cfg(target_arch = "x86_64")]
+fn scanned_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
+    use std::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8};
+
+    let mut commas = 0u128;
+    let mut quotes = 0u128;
+    let full = line.len() / 16 * 16;
+    let remainder = line.len() - full;
+    // SSE2 is available on x86-64. Each full load, including the overlapping
+    // load used for the tail, stays inside the borrowed line.
+    unsafe {
+        let comma = _mm_set1_epi8(b',' as i8);
+        let quote = _mm_set1_epi8(b'"' as i8);
+        let masks = |at| {
+            let block = _mm_loadu_si128(line.as_ptr().add(at).cast::<__m128i>());
+            (_mm_movemask_epi8(_mm_cmpeq_epi8(block, comma)) as u128,
+             _mm_movemask_epi8(_mm_cmpeq_epi8(block, quote)) as u128)
+        };
+        for at in (0..full).step_by(16) {
+            let (comma, quote) = masks(at);
+            commas |= comma << at;
+            quotes |= quote << at;
+        }
+        if remainder != 0 {
+            let (comma, quote) = masks(line.len() - 16);
+            commas |= (comma >> (16 - remainder)) << full;
+            quotes |= (quote >> (16 - remainder)) << full;
+        }
+    }
+    if commas.count_ones() as usize != N - 1 {
+        return None;
+    }
+    let mut values = [b"".as_slice(); N];
+    let mut start = 0;
+    for value in &mut values {
+        let stop = if commas == 0 { line.len() } else { commas.trailing_zeros() as usize };
+        let in_field = if stop == 128 { quotes } else { quotes & ((1u128 << stop) - 1) };
+        *value = if in_field == 0 {
+            &line[start..stop]
+        } else if stop - start >= 2 && in_field == (1u128 << start) | (1u128 << (stop - 1)) {
+            &line[start + 1..stop - 1]
+        } else {
+            return None;
+        };
+        quotes ^= in_field;
+        commas &= commas.wrapping_sub(1);
+        start = stop + 1;
+    }
+    Some(values)
 }
 
 #[derive(Clone, Copy)]
@@ -133,10 +192,8 @@ impl Table {
     fn chunks(&self) -> Vec<Chunk> {
         const CHUNK_BYTES: usize = 4 << 20;
         let mut chunks = vec![];
-        assert!(self.files.len() < 1 << (64 - FILE_SHIFT));
         for (file, mapping) in self.files.iter().enumerate() {
             let bytes = mapping.bytes();
-            assert!((bytes.len() as u64) < 1 << FILE_SHIFT);
             let Some(header_end) = find(bytes, b'\n') else { continue };
             let mut start = header_end + 1;
             while start < bytes.len() {
@@ -153,18 +210,12 @@ impl Table {
         self.files.iter().flat_map(|mapping| mapping.bytes().split(|&byte| byte == b'\n').skip(1))
     }
 
-    pub fn line(&self, row: Row) -> &[u8] {
-        let file = (row.location >> FILE_SHIFT) as usize;
-        let offset = (row.location & ((1 << FILE_SHIFT) - 1)) as usize;
-        let bytes = &self.files[file].bytes()[offset..];
-        &bytes[..find(bytes, b'\n').unwrap_or(bytes.len())]
-    }
-
-    pub fn partition(&self, threads: usize) -> Vec<Vec<Vec<Row>>> {
+    pub fn scan<'a, T: Send>(
+        &'a self, threads: usize, create: impl Fn() -> T + Sync,
+        parse: impl Fn(&mut T, &'a [u8]) + Sync,
+    ) -> Vec<T> {
         let chunks = self.chunks();
-        let workers = worker_map(threads, chunks.len(), || {
-            (0..SHARDS).map(|_| Vec::new()).collect::<Vec<_>>()
-        }, |buckets, index| {
+        worker_map(threads, chunks.len(), create, |worker, index| {
             let Chunk { file, start, end } = chunks[index];
             let bytes = self.files[file].bytes();
             let mut offset = start;
@@ -172,19 +223,10 @@ impl Table {
                 let remainder = &bytes[offset..end];
                 let line_len = find(remainder, b'\n').unwrap_or(remainder.len());
                 let line = &remainder[..line_len];
-                if let Some(comma) = find(line, b',') {
-                    if let Some(id) = unquote(&line[..comma]).filter(|id| !id.is_empty()) {
-                        let hash = hash_bytes(id);
-                        buckets[shard(hash)].push(Row {
-                            hash,
-                            location: ((file as u64) << FILE_SHIFT) | offset as u64,
-                        });
-                    }
-                }
+                parse(worker, line);
                 offset += line_len + 1;
             }
-        });
-        transpose(workers)
+        })
     }
 }
 
@@ -226,7 +268,7 @@ pub fn worker_map<T: Send>(
 }
 
 #[inline]
-fn mix(state: u64, value: u64) -> u64 {
+pub fn mix(state: u64, value: u64) -> u64 {
     (state.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95)
 }
 
@@ -266,7 +308,11 @@ impl Hasher for FastHasher {
 
     fn write_u64(&mut self, value: u64) { self.0 = mix(self.0, value); }
     fn write_usize(&mut self, value: usize) { self.write_u64(value as u64); }
-    fn finish(&self) -> u64 { self.0 }
+    fn finish(&self) -> u64 {
+        // The low bits alone retain shared character patterns in fixed-size IDs.
+        // Fold high bits into the bucket index before the table chooses a slot.
+        self.0 ^ (self.0 >> 33)
+    }
 }
 
 pub type Map<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FastHasher>>;
@@ -282,6 +328,14 @@ pub fn unsigned(bytes: &[u8]) -> Option<i64> {
         return None;
     }
     let mut value = 0i64;
+    if bytes.len() <= 18 {
+        for &byte in bytes {
+            let digit = byte.wrapping_sub(b'0');
+            if digit > 9 { return None; }
+            value = value * 10 + i64::from(digit);
+        }
+        return Some(value);
+    }
     for &byte in bytes {
         let digit = byte.wrapping_sub(b'0');
         if digit > 9 {
@@ -305,7 +359,7 @@ pub fn timestamp(bytes: &[u8]) -> Option<i64> {
     let hour = pair(&bytes[11..])?;
     let minute = pair(&bytes[14..])?;
     let second = pair(&bytes[17..])?;
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let leap = leap_year(year);
     let month_len = match month {
         4 | 6 | 9 | 11 => 30,
         2 if leap => 29,
@@ -328,16 +382,28 @@ pub fn timestamp(bytes: &[u8]) -> Option<i64> {
         }
         _ => return None,
     };
-    Some(days_from_civil(year, month, day) * DAY + ((hour * 60 + minute - offset) * 60 + second) * 1000)
+    let start_of_month = YEAR_START[year as usize] + MONTH_START[month as usize - 1];
+    let days = start_of_month + day - 1 + i64::from(leap && month > 2);
+    Some(days * DAY + ((hour * 60 + minute - offset) * 60 + second) * 1000)
 }
 
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = year - i64::from(month <= 2);
-    let era = year.div_euclid(400);
-    let year_in_era = year - era * 400;
-    let shifted_month = month + if month > 2 { -3 } else { 9 };
-    let day_in_year = (153 * shifted_month + 2) / 5 + day - 1;
-    era * 146_097 + year_in_era * 365 + year_in_era / 4 - year_in_era / 100 + day_in_year - 719_468
+const MONTH_START: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+static YEAR_START: [i64; 10_000] = year_starts();
+
+const fn leap_year(year: i64) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+const fn year_starts() -> [i64; 10_000] {
+    let mut result = [0; 10_000];
+    let mut year = 1;
+    let mut date = -719_162; // Days from 1970-01-01 back to 0001-01-01.
+    while year < result.len() {
+        result[year] = date;
+        date += if leap_year(year as i64) { 366 } else { 365 };
+        year += 1;
+    }
+    result
 }
 
 pub fn display_day(day: i32) -> String {
@@ -351,4 +417,41 @@ pub fn display_day(day: i32) -> String {
     let day_of_month = day_in_year - (153 * shifted_month + 2) / 5 + 1;
     let year = year_in_era + era * 400 + i64::from(month <= 2);
     format!("{year:04}-{month:02}-{day_of_month:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fields, scalar_fields};
+
+    #[test]
+    fn delimiter_scanner_matches_scalar() {
+        let mut random = 0x1234_5678_1234_5678u64;
+        let mut draw = || {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            random
+        };
+        for width in [2, 4, 7] {
+            for _ in 0..4096 {
+                let mut line = Vec::new();
+                for field in 0..width {
+                    if field != 0 { line.push(b','); }
+                    let quoted = draw() % 3 == 0;
+                    if quoted { line.push(b'"'); }
+                    for _ in 0..draw() % 26 { line.push(b'a'); }
+                    if quoted { line.push(b'"'); }
+                }
+                if !line.is_empty() && draw() % 2 == 0 {
+                    let index = draw() as usize % line.len();
+                    line[index] = if draw() % 2 == 0 { b',' } else { b'"' };
+                }
+                match width {
+                    2 => assert_eq!(fields::<2>(&line), scalar_fields::<2>(&line)),
+                    4 => assert_eq!(fields::<4>(&line), scalar_fields::<4>(&line)),
+                    _ => assert_eq!(fields::<7>(&line), scalar_fields::<7>(&line)),
+                }
+            }
+        }
+    }
 }

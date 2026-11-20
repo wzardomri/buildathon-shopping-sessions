@@ -2,6 +2,7 @@ FROM rust:1.85.1-slim-bookworm AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
+ARG RUSTFLAGS="-C target-cpu=x86-64-v3"
 RUN cargo build --release --locked --offline
 
 FROM python:3.12.9-slim-bookworm
