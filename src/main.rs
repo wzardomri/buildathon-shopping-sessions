@@ -3,15 +3,18 @@ mod group;
 mod identities;
 mod input;
 mod output;
+#[cfg(test)]
+mod reducer_tests;
 
 use click::{Click, ClickRecord, PackedClick};
 use identities::{Identities, Name, unpack};
-use input::{CHUNK_BYTES, DAY, IngestCalendar, Map, SHARDS, Table, WEEK, fields, find, hash_bytes, mix, timestamp, transpose, unsigned, worker_map};
+use input::{CHUNK_BYTES, DAY, IngestCalendar, Map, SHARDS, Table, WEEK, event_row_fields, fields, hash_bytes, mix, timestamp, transpose, unsigned, worker_map};
 use std::collections::hash_map::Entry;
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io;
+use std::mem::MaybeUninit;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -195,8 +198,90 @@ impl Candidate {
     }
 }
 
+const WINNER_BLOCK_ROWS: usize = 8;
+const WINNER_SEGMENT_ROWS: usize = 1024;
+const WINNER_SEGMENT_BLOCKS: usize = WINNER_SEGMENT_ROWS / WINNER_BLOCK_ROWS;
+
+#[repr(C, align(64))]
+struct WinnerBlock {
+    keys: [MaybeUninit<u64>; WINNER_BLOCK_ROWS],
+    candidates: [MaybeUninit<Candidate>; WINNER_BLOCK_ROWS],
+}
+
+#[derive(Default)]
+struct PackedCandidates {
+    segments: Vec<Box<[WinnerBlock; WINNER_SEGMENT_BLOCKS]>>,
+    len: usize,
+}
+
+impl PackedCandidates {
+    #[cold]
+    #[inline(never)]
+    fn add_segment(&mut self) {
+        // Each block consists only of MaybeUninit lanes. The array can be
+        // allocated without writing any lane and is dropped without reading
+        // any lane. Later, len limits reads to the initialized prefix.
+        let segment = unsafe { Box::<[WinnerBlock; WINNER_SEGMENT_BLOCKS]>::new_uninit().assume_init() };
+        self.segments.push(segment);
+    }
+
+    #[inline]
+    fn push(&mut self, key: u64, candidate: Candidate) {
+        let row = self.len % WINNER_SEGMENT_ROWS;
+        if row == 0 {
+            self.add_segment();
+        }
+        let block = &mut self.segments.last_mut().unwrap()[row / WINNER_BLOCK_ROWS];
+        block.keys[row % WINNER_BLOCK_ROWS].write(key);
+        block.candidates[row % WINNER_BLOCK_ROWS].write(candidate);
+        self.len += 1;
+    }
+
+    #[inline]
+    fn block(&self, index: usize) -> &WinnerBlock {
+        assert!(index < self.len);
+        let row = index % WINNER_SEGMENT_ROWS;
+        &self.segments[index / WINNER_SEGMENT_ROWS][row / WINNER_BLOCK_ROWS]
+    }
+
+    #[inline]
+    fn key_at(&self, index: usize) -> u64 {
+        // The block accessor checks that this lane was initialized by push.
+        unsafe { *self.block(index).keys[index % WINNER_BLOCK_ROWS].assume_init_ref() }
+    }
+}
+
+trait WinnerRows<K> {
+    fn len(&self) -> usize;
+    fn keys(&self) -> impl Iterator<Item = K>;
+    fn candidate_at(&self, index: usize) -> Candidate;
+}
+
+impl WinnerRows<u64> for PackedCandidates {
+    fn len(&self) -> usize { self.len }
+
+    fn keys(&self) -> impl Iterator<Item = u64> {
+        self.segments.iter().flat_map(|segment| segment.iter())
+            .flat_map(|block| block.keys.iter()).take(self.len)
+            // The take is before the read, excluding every unwritten lane.
+            .map(|key| unsafe { *key.assume_init_ref() })
+    }
+
+    #[inline]
+    fn candidate_at(&self, index: usize) -> Candidate {
+        // The block accessor checks that this lane was initialized by push.
+        unsafe { *self.block(index).candidates[index % WINNER_BLOCK_ROWS].assume_init_ref() }
+    }
+}
+
+impl<K: Copy> WinnerRows<K> for Vec<(K, Candidate)> {
+    fn len(&self) -> usize { Vec::len(self) }
+    fn keys(&self) -> impl Iterator<Item = K> { self.iter().map(|&(key, _)| key) }
+    fn candidate_at(&self, index: usize) -> Candidate { self[index].1 }
+}
+
 struct FusedEventBatch<'a, E> {
-    packed: Vec<Vec<(u64, Candidate)>>,
+    packed: Vec<PackedCandidates>,
     full: Vec<Vec<(Key<'a>, Candidate)>>,
     wide_ingests: Vec<i64>,
     output: group::Rows<'a, E>,
@@ -213,7 +298,7 @@ fn winner_shard(hash: u64) -> usize { ((hash >> 32) as usize) & (WINNER_SHARDS -
 impl<'a, E: EventRecord> FusedEventBatch<'a, E> {
     fn new() -> Self {
         Self {
-            packed: (0..WINNER_SHARDS).map(|_| Vec::new()).collect(),
+            packed: (0..WINNER_SHARDS).map(|_| PackedCandidates::default()).collect(),
             full: (0..WINNER_SHARDS).map(|_| Vec::new()).collect(),
             wide_ingests: Vec::new(),
             output: group::Rows::new(),
@@ -222,8 +307,8 @@ impl<'a, E: EventRecord> FusedEventBatch<'a, E> {
     }
 
     fn accepts_chunk(&self) -> bool {
-        // Table chunks end just after the next newline from CHUNK_BYTES. The
-        // last row can start at that offset, so it adds at most one more row.
+        // The 4 MiB ordinary and 16 MiB cold plans both have at most
+        // CHUNK_BYTES admitted candidates plus one row spanning the end.
         self.candidates <= group::MAX_LOCATED_ROWS - CHUNK_BYTES - 1
     }
 
@@ -231,10 +316,9 @@ impl<'a, E: EventRecord> FusedEventBatch<'a, E> {
         &mut self, mut bytes: &'a [u8], catalog: &Catalog<'a>, window: Window, calendar: &IngestCalendar,
     ) {
         while !bytes.is_empty() {
-            let end = find(bytes, b'\n').unwrap_or(bytes.len());
-            let line = &bytes[..end];
-            bytes = &bytes[(end + 1).min(bytes.len())..];
-            let Some([id, user, at, ingest, kind, product, price]) = fields(line) else { continue };
+            let (consumed, fields) = event_row_fields(bytes);
+            bytes = &bytes[consumed..];
+            let Some([id, user, at, ingest, kind, product, price]) = fields else { continue };
             if id.is_empty() { continue; }
             let Some((ingest, direct_code)) = calendar.parse(ingest) else { continue };
             let location = match prepare_event_row::<E>(user, at, ingest, kind, product, price, catalog, window, calendar) {
@@ -253,7 +337,7 @@ impl<'a, E: EventRecord> FusedEventBatch<'a, E> {
                 // Odd multiplication followed by xor-shift is reversible, so
                 // the full hash identifies a packed spelling without collision.
                 let hash = fold_hash(mix(0, key));
-                self.packed[winner_shard(hash)].push((hash, candidate));
+                self.packed[winner_shard(hash)].push(hash, candidate);
             } else {
                 let key = Key::new(id);
                 self.full[winner_shard(key.hash)].push((key, candidate));
@@ -284,25 +368,26 @@ fn repeat_slot(hash: u64, mask: usize) -> (usize, u64) {
     (slot >> 5, 1 << ((slot & 31) * 2))
 }
 
-fn mark_fused_losers<K: Eq + Hash>(
-    parts: Vec<(u32, Vec<(K, Candidate)>)>, wide_ingests: &[Vec<i64>],
+fn mark_fused_losers<K: Eq + Hash, Rows: WinnerRows<K>>(
+    parts: Vec<(u32, Rows)>, wide_ingests: &[Vec<i64>],
     fingerprint: impl Fn(&K) -> u64, losers: &mut Vec<(u32, u32)>,
 ) {
     let count = parts.iter().map(|(_, candidates)| candidates.len()).sum::<usize>();
     if count < 2 { return; }
     let slots = count.saturating_mul(12).next_power_of_two().max(32);
     let mut counts = vec![0u64; slots / 32];
-    for (key, _) in parts.iter().flat_map(|(_, candidates)| candidates) {
-        let (word, seen) = repeat_slot(fingerprint(key), slots - 1);
+    for key in parts.iter().flat_map(|(_, candidates)| candidates.keys()) {
+        let (word, seen) = repeat_slot(fingerprint(&key), slots - 1);
         let bits = &mut counts[word];
         *bits |= seen | ((*bits & seen) << 1);
     }
     let mut winners = Map::<K, PendingEvent>::with_capacity_and_hasher(count / 6, Default::default());
     for (batch, candidates) in parts {
         let wide = &wide_ingests[batch as usize];
-        for (key, candidate) in candidates {
+        for (index, key) in candidates.keys().enumerate() {
             let (word, seen) = repeat_slot(fingerprint(&key), slots - 1);
             if counts[word] & (seen << 1) == 0 { continue; }
+            let candidate = candidates.candidate_at(index);
             let pending = PendingEvent { batch, location: candidate.location, ingest: candidate.ingest(wide) };
             match winners.entry(key) {
                 Entry::Vacant(entry) => { entry.insert(pending); }
@@ -350,7 +435,7 @@ fn index_masks(entries: &[u32; INDEX_LANES], mask: u32, tag: u32) -> (u32, u32) 
 }
 
 fn mark_packed_losers(
-    parts: Vec<(u32, Vec<(u64, Candidate)>)>, wide_ingests: &[Vec<i64>],
+    parts: Vec<(u32, PackedCandidates)>, wide_ingests: &[Vec<i64>],
     table: &mut Vec<u32>, losers: &mut Vec<(u32, u32)>,
 ) {
     let count = parts.iter().map(|(_, rows)| rows.len()).sum::<usize>();
@@ -375,7 +460,7 @@ fn mark_packed_losers(
     for (part, (batch, rows)) in parts.iter().enumerate() {
         let reference_base = (part as u32) << row_bits;
         let wide = &wide_ingests[*batch as usize];
-        'candidate: for (index, &(key, candidate)) in rows.iter().enumerate() {
+        'candidate: for (index, key) in rows.keys().enumerate() {
             let fingerprint = fold_hash(mix(0, key));
             let tag = (fingerprint >> 32) as u32 & !reference_mask;
             let reference = reference_base + index as u32 + 1; // Zero marks an empty slot.
@@ -389,10 +474,12 @@ fn mark_packed_losers(
                     let stored = table[slot];
                     let previous_ref = (stored & reference_mask) - 1;
                     let (previous_batch, previous_rows) = &parts[(previous_ref >> row_bits) as usize];
-                    let (previous_key, previous) = previous_rows[(previous_ref & row_mask) as usize];
-                    if previous_key == key {
+                    let previous_index = (previous_ref & row_mask) as usize;
+                    if previous_rows.key_at(previous_index) == key {
                         // The complete packed key is injective. A tag match
                         // alone can only justify reading that key.
+                        let candidate = rows.candidate_at(index);
+                        let previous = previous_rows.candidate_at(previous_index);
                         let previous_wide = &wide_ingests[*previous_batch as usize];
                         let (loser_batch, loser) = if candidate.ingest(wide) < previous.ingest(previous_wide) {
                             table[slot] = tag | reference;
@@ -442,7 +529,7 @@ fn load_events<'a, E: EventRecord>(
 ) -> Vec<group::Batch<'a, E>> {
     let stage = Instant::now();
     let calendar = IngestCalendar::new(window.start, window.end);
-    let chunks = table.data_chunks();
+    let chunks = table.event_chunks(threads);
     let workers = worker_map(threads, chunks.len(), || vec![FusedEventBatch::<E>::new()], |batches, index| {
         if !batches.last().unwrap().accepts_chunk() {
             batches.push(FusedEventBatch::new());
@@ -460,7 +547,7 @@ fn load_events<'a, E: EventRecord>(
         output.push((rows, Vec::new()));
         for ((job, packed), full) in jobs.iter_mut().zip(packed).zip(full) {
             let (packed_parts, full_parts) = job.get_mut().unwrap();
-            if !packed.is_empty() { packed_parts.push((batch, packed)); }
+            if packed.len() != 0 { packed_parts.push((batch, packed)); }
             if !full.is_empty() { full_parts.push((batch, full)); }
         }
     }
@@ -589,10 +676,15 @@ impl UserDay {
 struct Work {
     users: output::Users,
     totals: CampaignTotals,
-    anchors: Vec<i64>,
-    windows: Vec<Option<(i64, i64)>>,
+    anchors: Vec<Anchor>,
+    assist_ends: Vec<usize>,
     seen: Vec<usize>,
     categories: Vec<(u32, u64)>,
+}
+
+struct Anchor {
+    at: i64,
+    revenue: u64,
 }
 
 impl Work {
@@ -601,7 +693,7 @@ impl Work {
             users: output::Users::new(),
             totals: CampaignTotals::new(window, campaigns),
             anchors: vec![],
-            windows: vec![None; campaigns],
+            assist_ends: vec![0; campaigns],
             seen: vec![],
             categories: vec![],
         }
@@ -617,62 +709,59 @@ impl Work {
         click_origin: i64,
     ) {
         events.sort_unstable_by_key(|event| event.sort_key());
-        clicks.sort_unstable_by(|a, b| a.sort_key().cmp(&b.sort_key()).then_with(|| a.id().cmp(b.id())));
         self.anchors.clear();
+        let has_clicks = !clicks.is_empty();
         let mut day_totals = UserDay {
             categories: std::mem::take(&mut self.categories),
             ..UserDay::default()
         };
-        let mut cursor = 0;
-        let mut best: Option<C> = None;
-        let mut start = 0;
-        let mut day = day_of(events[0].timestamp(start_ms));
-        while start < events.len() {
-            let at = events[start].timestamp(start_ms);
-            let session_day = day_of(at);
-            if day != session_day {
-                self.write_user_day(name, day, &day_totals);
-                day_totals.sessions = 0;
-                day_totals.events = 0;
-                day_totals.revenue = 0;
-                day_totals.categories.clear();
-                day = session_day;
-            }
-            let mut end = start + 1;
-            while end < events.len() && events[end].sort_key() - events[end - 1].sort_key() <= SESSION_GAP {
-                end += 1;
-            }
-            let mut revenue = 0;
-            for event in &events[start..end] {
-                let (price, category) = event.purchase();
-                if price != 0 {
-                    let price = u64::from(price);
-                    revenue += price;
-                    day_totals.purchase(category, price);
+        let mut at = events[0].timestamp(start_ms);
+        let mut day = day_of(at);
+        let mut previous = events[0].sort_key();
+        let mut revenue = 0;
+        for &event in events.iter() {
+            let key = event.sort_key();
+            if key - previous > SESSION_GAP {
+                day_totals.sessions += 1;
+                self.finish_anchor(at, day, revenue, has_clicks, catalog.organic);
+                at = event.timestamp(start_ms);
+                let next_day = day_of(at);
+                if day != next_day {
+                    self.write_user_day(name, day, &day_totals);
+                    day_totals.sessions = 0;
+                    day_totals.events = 0;
+                    day_totals.revenue = 0;
+                    day_totals.categories.clear();
+                    day = next_day;
                 }
+                revenue = 0;
             }
-            day_totals.sessions += 1;
-            day_totals.events += (end - start) as u64;
-            self.anchors.push(at);
-            let cutoff = C::time_key(at, click_origin);
-            while let Some(&click) = clicks.get(cursor).filter(|click| click.sort_key() <= cutoff) {
-                if best.is_none_or(|before| click.sort_key() > before.sort_key()) {
-                    best = Some(click);
-                }
-                cursor += 1;
+            day_totals.events += 1;
+            let (price, category) = event.purchase();
+            if price != 0 {
+                let price = u64::from(price);
+                revenue += price;
+                day_totals.purchase(category, price);
             }
-            let campaign = best.filter(|click| click.sort_key() >= cutoff - WEEK)
-                .map_or(catalog.organic, C::campaign);
-            let total = self.totals.for_day(campaign, day);
-            total.sessions += 1;
-            total.purchasing += u64::from(revenue != 0);
-            total.revenue += revenue;
-            start = end;
+            previous = key;
         }
+        day_totals.sessions += 1;
+        self.finish_anchor(at, day, revenue, has_clicks, catalog.organic);
         self.write_user_day(name, day, &day_totals);
         self.categories = day_totals.categories;
         self.categories.clear();
-        self.assists(&clicks[..cursor], click_origin);
+        if has_clicks {
+            clicks.sort_unstable_by(|a, b| a.sort_key().cmp(&b.sort_key()).then_with(|| a.id().cmp(b.id())));
+            self.attribute(clicks, click_origin, catalog.organic);
+        }
+    }
+
+    fn finish_anchor(&mut self, at: i64, day: i32, revenue: u64, has_clicks: bool, organic: u32) {
+        if has_clicks {
+            self.anchors.push(Anchor { at, revenue });
+        } else {
+            credit(&mut self.totals, organic, day, revenue);
+        }
     }
 
     fn write_user_day(&mut self, name: &[u8], day: i32, totals: &UserDay) {
@@ -681,45 +770,79 @@ impl Work {
         self.users.push(name, day, totals.sessions, totals.events, totals.revenue, top);
     }
 
-    fn assists<'a, C: ClickRecord<'a>>(&mut self, clicks: &[C], origin: i64) {
+    fn attribute<'a, C: ClickRecord<'a>>(&mut self, clicks: &[C], origin: i64, organic: u32) {
+        let anchors = &self.anchors;
+        let mut before = 0;
+        let mut through = 0;
+        let mut best: Option<(i64, i64, u32)> = None; // click time, inclusive expiry, campaign
         for &click in clicks {
-            let campaign = click.campaign();
-            let index = campaign as usize;
             let at = click.timestamp(origin);
-            let window = (at, at.saturating_add(WEEK));
-            match self.windows[index] {
-                Some((first, last)) if at <= last => self.windows[index] = Some((first, window.1)),
-                pending => {
-                    if let Some((first, last)) = pending {
-                        count_assists(&self.anchors, &mut self.totals, campaign, first, last);
-                    } else {
-                        self.seen.push(index);
+            // Only finish anchors strictly before this click. Every click at an
+            // anchor's exact timestamp participates in both credit and assists.
+            while let Some(anchor) = anchors.get(before).filter(|anchor| anchor.at < at) {
+                credit_anchor(&mut self.totals, anchor, best, organic);
+                before += 1;
+            }
+            if before == anchors.len() {
+                break;
+            }
+            through = through.max(before);
+            let expiry = at.saturating_add(WEEK);
+            while anchors.get(through).is_some_and(|anchor| anchor.at <= expiry) {
+                through += 1;
+            }
+            if before == through {
+                continue;
+            }
+            let campaign = click.campaign();
+            // Timestamp ties arrive in ascending full click-ID order.
+            if best.is_none_or(|(earlier, _, _)| earlier < at) {
+                best = Some((at, expiry, campaign));
+            }
+            // Eligibility's lower bound never moves backwards. Any already
+            // covered positions at or after `before` lie in the most recent
+            // interval for this campaign, including under disjoint intervals.
+            let end = &mut self.assist_ends[campaign as usize];
+            let mut first = before.max(*end);
+            if first < through {
+                if *end == 0 {
+                    self.seen.push(campaign as usize);
+                }
+                *end = through;
+                while first < through {
+                    let day = day_of(anchors[first].at);
+                    let day_end = (i64::from(day) + 1) * DAY;
+                    let mut next = first + 1;
+                    while next < through && anchors[next].at < day_end {
+                        next += 1;
                     }
-                    self.windows[index] = Some(window);
+                    self.totals.for_day(campaign, day).assisted += (next - first) as u64;
+                    first = next;
                 }
             }
         }
+        for anchor in &anchors[before..] {
+            credit_anchor(&mut self.totals, anchor, best, organic);
+        }
         for campaign in self.seen.drain(..) {
-            let (first, last) = self.windows[campaign].take().unwrap();
-            count_assists(&self.anchors, &mut self.totals, campaign as u32, first, last);
+            self.assist_ends[campaign] = 0;
         }
     }
 }
 
 fn day_of(at: i64) -> i32 { at.div_euclid(DAY) as i32 }
 
-fn count_assists(
-    anchors: &[i64], totals: &mut CampaignTotals, campaign: u32, first: i64, last: i64,
-) {
-    let mut start = anchors.partition_point(|&at| at < first);
-    let end = start + anchors[start..].partition_point(|&at| at <= last);
-    while start < end {
-        let day = day_of(anchors[start]);
-        let day_end = (i64::from(day) + 1) * DAY;
-        let matching = anchors[start..end].partition_point(|&at| at < day_end);
-        totals.for_day(campaign, day).assisted += matching as u64;
-        start += matching;
-    }
+fn credit_anchor(totals: &mut CampaignTotals, anchor: &Anchor, best: Option<(i64, i64, u32)>, organic: u32) {
+    let campaign = best.filter(|&(_, expiry, _)| anchor.at <= expiry)
+        .map_or(organic, |(_, _, campaign)| campaign);
+    credit(totals, campaign, day_of(anchor.at), anchor.revenue);
+}
+
+fn credit(totals: &mut CampaignTotals, campaign: u32, day: i32, revenue: u64) {
+    let row = totals.for_day(campaign, day);
+    row.sessions += 1;
+    row.purchasing += u64::from(revenue != 0);
+    row.revenue += revenue;
 }
 
 fn solve(data: &Path, scratch: &Path, threads: usize) -> io::Result<()> {

@@ -1,3 +1,5 @@
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::ffi::c_void;
 use std::fs::{self, File};
 use std::hash::{BuildHasherDefault, Hasher};
@@ -12,6 +14,10 @@ pub const DAY: i64 = 86_400_000;
 pub const WEEK: i64 = 7 * DAY;
 pub const SHARDS: usize = 128;
 pub const CHUNK_BYTES: usize = 4 << 20;
+const COLD_EVENT_CHUNK_BYTES: usize = 16 << 20;
+// A terminated candidate needs an ID byte, ingest byte, six commas and LF.
+// A nominal cold range can extend to finish one physical row.
+const _: () = assert!(COLD_EVENT_CHUNK_BYTES / 9 <= CHUNK_BYTES);
 
 unsafe extern "C" {
     fn mmap(address: *mut c_void, len: usize, protection: i32, flags: i32, fd: i32, offset: i64) -> *mut c_void;
@@ -145,14 +151,18 @@ fn bits_at_commas(bits: u128, commas: u128) -> u64 {
 }
 
 #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[inline(always)]
 fn scanned_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
-    let (mut commas, quotes) = delimiter_masks(line);
-    if commas.count_ones() as usize != N - 1 {
-        return None;
-    }
+    let (commas, quotes) = delimiter_masks(line);
+    fields_from_masks(line, commas, quotes)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[inline(always)]
+fn csv_wrapper_bits<const N: usize>(line_len: usize, commas: u128, quotes: u128) -> Option<u64> {
     let mut wrapped = 0;
     if quotes != 0 {
-        let end = 1u128 << (line.len() - 1);
+        let end = 1u128 << (line_len - 1);
         let opens = quotes & ((commas << 1) | 1);
         let closes = quotes & ((commas >> 1) | end);
         // A quote can only be the first or last byte of a field. A single
@@ -168,17 +178,124 @@ fn scanned_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
             return None;
         }
     }
+    Some(wrapped)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[inline(always)]
+fn fields_from_masks<const N: usize>(line: &[u8], mut commas: u128, quotes: u128) -> Option<[&[u8]; N]> {
+    if commas.count_ones() as usize != N - 1 {
+        return None;
+    }
+    let mut wrapped = csv_wrapper_bits::<N>(line.len(), commas, quotes)?;
     let mut values = [b"".as_slice(); N];
     let mut start = 0;
-    for value in &mut values {
-        let stop = if commas == 0 { line.len() } else { commas.trailing_zeros() as usize };
+    for value in &mut values[..N - 1] {
+        let stop = commas.trailing_zeros() as usize;
         let padding = (wrapped as usize) & 1;
-        *value = &line[start + padding..stop - padding];
+        // The delimiter mask has exactly N - 1 set bits at valid, ordered
+        // byte positions. If padding is one, the quote validation proved
+        // the field has two distinct quotes before the stop.
+        *value = unsafe { line.get_unchecked(start + padding..stop - padding) };
         wrapped >>= 1;
-        commas &= commas.wrapping_sub(1);
+        commas &= commas - 1;
+        start = stop + 1;
+    }
+    let padding = (wrapped as usize) & 1;
+    // Every comma lies within the line, and the final field passed the
+    // same quote validation as preceding fields.
+    values[N - 1] = unsafe { line.get_unchecked(start + padding..line.len() - padding) };
+    Some(values)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+fn split_event_fields(line: &[u8], commas: u128, quotes: u128) -> Option<[&[u8]; 7]> {
+    let first_block = commas as u32;
+    let suffix = (commas >> 32) as u64;
+    if first_block.count_ones() != 2 || suffix.count_ones() != 4 {
+        return event_mask_fallback(line, commas, quotes);
+    }
+    let mut wrapped = csv_wrapper_bits::<7>(line.len(), commas, quotes)?;
+    // The first SIMD block has two delimiters and the remaining two
+    // blocks have four. Decode each ordered subset in its own register.
+    let without_third = suffix & (suffix - 1);
+    let without_fourth = without_third & (without_third - 1);
+    let stops = [
+        first_block.trailing_zeros() as usize,
+        (31 - first_block.leading_zeros()) as usize,
+        32 + suffix.trailing_zeros() as usize,
+        32 + without_third.trailing_zeros() as usize,
+        32 + without_fourth.trailing_zeros() as usize,
+        95 - suffix.leading_zeros() as usize,
+        line.len(),
+    ];
+    let mut values = [b"".as_slice(); 7];
+    let mut start = 0;
+    for (value, stop) in values.iter_mut().zip(stops) {
+        let padding = (wrapped & 1) as usize;
+        // The masks came from within the row and contain exactly six
+        // distinct separators. Wrapping is proven for both endpoints.
+        *value = unsafe { line.get_unchecked(start + padding..stop - padding) };
+        wrapped >>= 1;
         start = stop + 1;
     }
     Some(values)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[cold]
+#[inline(never)]
+fn event_mask_fallback(line: &[u8], commas: u128, quotes: u128) -> Option<[&[u8]; 7]> {
+    fields_from_masks(line, commas, quotes)
+}
+
+#[inline]
+pub fn event_row_fields(bytes: &[u8]) -> (usize, Option<[&[u8]; 7]>) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    if let Some((end, commas, quotes)) = short_event_masks(bytes) {
+        return (end + 1, split_event_fields(&bytes[..end], commas, quotes));
+    }
+    let end = find(bytes, b'\n').unwrap_or(bytes.len());
+    ((end + 1).min(bytes.len()), fields(&bytes[..end]))
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline]
+fn short_event_masks(bytes: &[u8]) -> Option<(usize, u128, u128)> {
+    use std::arch::x86_64::{
+        __m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
+    };
+    if bytes.len() < 96 {
+        return None;
+    }
+    // All three possible loads are in bounds. Bits at and after the
+    // first LF are dropped, including delimiters from subsequent rows.
+    unsafe {
+        let mask = |block, delimiter| _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, delimiter)) as u32;
+        let (lf, comma, quote) = (_mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b',' as i8),
+                                  _mm256_set1_epi8(b'"' as i8));
+        let first = _mm256_loadu_si256(bytes.as_ptr().cast::<__m256i>());
+        let second = _mm256_loadu_si256(bytes.as_ptr().add(32).cast::<__m256i>());
+        let low_mask = |delimiter| u64::from(mask(first, delimiter)) | (u64::from(mask(second, delimiter)) << 32);
+        let low_lf = low_mask(lf);
+        if low_lf != 0 {
+            let end = low_lf.trailing_zeros();
+            let keep_low = (1u64 << end) - 1;
+            return Some((end as usize, u128::from(low_mask(comma) & keep_low),
+                u128::from(low_mask(quote) & keep_low)));
+        }
+        let third = _mm256_loadu_si256(bytes.as_ptr().add(64).cast::<__m256i>());
+        let high_lf = mask(third, lf);
+        if high_lf == 0 {
+            return None;
+        }
+        let high_end = high_lf.trailing_zeros();
+        let keep_high = (1u32 << high_end) - 1;
+        let commas = u128::from(low_mask(comma)) | (u128::from(mask(third, comma) & keep_high) << 64);
+        let quotes = u128::from(low_mask(quote)) | (u128::from(mask(third, quote) & keep_high) << 64);
+        Some((64 + high_end as usize, commas, quotes))
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -258,6 +375,31 @@ struct Chunk {
     end: usize,
 }
 
+fn file_waves(chunks: &[Chunk], threads: usize) -> Vec<Chunk> {
+    let files: Vec<_> = chunks.chunk_by(|left, right| left.file == right.file).collect();
+    let mut ready: BinaryHeap<_> = files.iter().enumerate().map(|(file, ranges)| {
+        (ranges.last().unwrap().end - ranges[0].start, Reverse(file), 0)
+    }).collect();
+    let mut result = Vec::with_capacity(chunks.len());
+    let width = threads.max(1).min(files.len());
+    let mut wave = Vec::with_capacity(width);
+    while !ready.is_empty() {
+        for _ in 0..width {
+            let Some((_, Reverse(file), index)) = ready.pop() else { break };
+            let ranges = files[file];
+            result.push(ranges[index]);
+            if let Some(next) = ranges.get(index + 1) {
+                let remaining = ranges.last().unwrap().end - next.start;
+                wave.push((remaining, Reverse(file), index + 1));
+            }
+        }
+        // Give each wave different file descriptions where available,
+        // prioritizing long streams so small files can fill the tail.
+        ready.extend(wave.drain(..));
+    }
+    result
+}
+
 pub struct Table {
     files: Vec<Mapping>,
 }
@@ -279,13 +421,17 @@ impl Table {
     }
 
     fn chunks(&self) -> Vec<Chunk> {
+        self.chunks_sized(CHUNK_BYTES)
+    }
+
+    fn chunks_sized(&self, chunk_bytes: usize) -> Vec<Chunk> {
         let mut chunks = vec![];
         for (file, mapping) in self.files.iter().enumerate() {
             let bytes = mapping.bytes();
             let Some(header_end) = find(bytes, b'\n') else { continue };
             let mut start = header_end + 1;
             while start < bytes.len() {
-                let limit = (start + CHUNK_BYTES).min(bytes.len());
+                let limit = start.saturating_add(chunk_bytes).min(bytes.len());
                 let end = limit + find(&bytes[limit..], b'\n').map_or(bytes.len() - limit, |i| i + 1);
                 chunks.push(Chunk { file, start, end });
                 start = end;
@@ -303,6 +449,62 @@ impl Table {
             &self.files[chunk.file].bytes()[chunk.start..chunk.end]
         }).collect()
     }
+
+    pub fn event_chunks(&self, threads: usize) -> Vec<&[u8]> {
+        if !self.cold_across_files(threads) {
+            return self.data_chunks();
+        }
+        let chunks = self.chunks_sized(COLD_EVENT_CHUNK_BYTES);
+        let waves = file_waves(&chunks, threads);
+        eprintln!("cold event file waves  {} ranges", waves.len());
+        waves.into_iter().map(|chunk| &self.files[chunk.file].bytes()[chunk.start..chunk.end]).collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cold_across_files(&self, threads: usize) -> bool {
+        const SAMPLES: usize = 16;
+        let size = self.files.iter().fold(0usize, |sum, file| sum.saturating_add(file.len));
+        let substantial = self.files.iter().filter(|file| file.len >= COLD_EVENT_CHUNK_BYTES)
+            .take(threads).count();
+        if threads < 2 || substantial < threads
+            || size < COLD_EVENT_CHUNK_BYTES.saturating_mul(threads).saturating_mul(12)
+        {
+            return false;
+        }
+        unsafe extern "C" {
+            fn getpagesize() -> i32;
+            fn mincore(address: *mut c_void, length: usize, residency: *mut u8) -> i32;
+        }
+        let Ok(page) = usize::try_from(unsafe { getpagesize() }) else { return false };
+        if page == 0 {
+            return false;
+        }
+        let stride = size / SAMPLES;
+        let mut next = stride / 2;
+        let (mut probes, mut usable, mut cold) = (0, 0, 0);
+        'files: for file in &self.files {
+            while next < file.len {
+                // mmap starts at a page boundary, and this offset lies
+                // inside the live read-only mapping. The probe reads no bytes.
+                let address = file.address.cast::<u8>().wrapping_add(next - next % page);
+                let mut residency = 0u8;
+                if unsafe { mincore(address.cast(), 1, &mut residency) } == 0 {
+                    usable += 1;
+                    cold += usize::from(residency & 1 == 0);
+                }
+                probes += 1;
+                if probes == SAMPLES {
+                    break 'files;
+                }
+                next = next.saturating_add(stride);
+            }
+            next -= file.len;
+        }
+        usable >= 12 && cold * 4 >= usable * 3
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn cold_across_files(&self, _: usize) -> bool { false }
 
     pub fn scan<'a, T: Send>(
         &'a self, threads: usize, create: impl Fn() -> T + Sync,
@@ -440,7 +642,40 @@ pub fn unsigned(bytes: &[u8]) -> Option<i64> {
     Some(value)
 }
 
+#[inline]
+fn decimal_word(digits: u64) -> u32 {
+    // Little-endian byte lanes carry one digit each. Each multiply-add
+    // stays within its lane before the mask retains the merged result.
+    let pairs = (digits * 10 + (digits >> 8)) & 0x00ff_00ff_00ff_00ff;
+    let groups = (pairs * 100 + (pairs >> 16)) & 0x0000_ffff_0000_ffff;
+    (groups * 10_000 + (groups >> 32)) as u32
+}
+
+#[inline]
+fn decimal_epoch(bytes: &[u8; 13]) -> Option<i64> {
+    const HIGH_NIBBLES: u64 = 0xf0f0_f0f0_f0f0_f0f0;
+    const ASCII_DIGITS: u64 = 0x3030_3030_3030_3030;
+    const SIXES: u64 = 0x0606_0606_0606_0606;
+    const TENS: u64 = 0x1010_1010_1010_1010;
+
+    let head = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let tail = u64::from_le_bytes(bytes[5..].try_into().unwrap());
+    if ((head ^ ASCII_DIGITS) | (tail ^ ASCII_DIGITS)) & HIGH_NIBBLES != 0 {
+        return None;
+    }
+    let head = head & !HIGH_NIBBLES;
+    // The two safe loads overlap by three already-validated head bytes.
+    let tail = tail & !0x00ff_ffff & !HIGH_NIBBLES;
+    if ((head + SIXES) | (tail + SIXES)) & TENS != 0 {
+        return None;
+    }
+    Some(i64::from(decimal_word(head)) * 100_000 + i64::from(decimal_word(tail)))
+}
+
 pub fn timestamp(bytes: &[u8]) -> Option<i64> {
+    if let Ok(decimal) = <&[u8; 13]>::try_from(bytes) {
+        return decimal_epoch(decimal);
+    }
     if !matches!(bytes.len(), 20 | 25) || bytes.get(4) != Some(&b'-') {
         return unsigned(bytes);
     }
@@ -485,6 +720,38 @@ pub struct IngestCalendar {
     days: [([u8; 11], i64); 64],
 }
 
+const INVALID_CLOCK: u32 = 1 << 28;
+const CLOCK_HOURS: [u32; 256] = clock_table(24, 3600);
+const CLOCK_MINUTES: [u32; 256] = clock_table(60, 60);
+const CLOCK_SECONDS: [u32; 256] = clock_table(60, 1);
+
+const fn clock_table(limit: usize, scale: u32) -> [u32; 256] {
+    let mut table = [INVALID_CLOCK; 256];
+    let mut number = 0;
+    while number < limit {
+        table[(number / 10) | ((number % 10) << 4)] = number as u32 * scale;
+        number += 1;
+    }
+    table
+}
+
+#[inline]
+fn clock_seconds(clock: &[u8; 8]) -> Option<i64> {
+    const DIGIT_HIGH: u64 = 0xf0f0_00f0_f000_f0f0;
+    const FIXED_BYTES: u64 = 0x0000_ff00_00ff_0000;
+    const FIXED_FORM: u64 = u64::from_le_bytes(*b"00:00:00");
+    let raw = u64::from_le_bytes(*clock);
+    if (raw ^ FIXED_FORM) & (DIGIT_HIGH | FIXED_BYTES) != 0 {
+        return None;
+    }
+    let digits = raw & 0x0f0f_000f_0f00_0f0f;
+    let pairs = digits | (digits >> 4);
+    let seconds = CLOCK_HOURS[(pairs as u8) as usize]
+        + CLOCK_MINUTES[((pairs >> 24) as u8) as usize]
+        + CLOCK_SECONDS[((pairs >> 48) as u8) as usize];
+    (seconds < INVALID_CLOCK).then_some(i64::from(seconds))
+}
+
 impl IngestCalendar {
     pub const DEFER_CODE: u32 = u32::MAX;
 
@@ -509,36 +776,39 @@ impl IngestCalendar {
     }
 
     #[inline]
+    fn matching_midnight(&self, prefix: &[u8; 11]) -> Option<i64> {
+        let (expected, midnight) = &self.days[Self::bucket(prefix)];
+        (prefix == expected && prefix[10] == b'T').then_some(*midnight)
+    }
+
+    #[inline]
     pub fn parse(&self, bytes: &[u8]) -> Option<(i64, u32)> {
         if let Ok(clock) = <&[u8; 20]>::try_from(bytes) {
-            let prefix = <&[u8; 11]>::try_from(&clock[..11]).unwrap();
-            let (expected, midnight) = &self.days[Self::bucket(prefix)];
-            if prefix == expected && clock[10] == b'T' && clock[19] == b'Z' {
-                const DIGIT_HIGH: u64 = 0xf0f0_00f0_f000_f0f0;
-                const FIXED_BYTES: u64 = 0x0000_ff00_00ff_0000;
-                const FIXED_FORM: u64 = u64::from_le_bytes(*b"00:00:00");
-                let raw = u64::from_le_bytes(clock[11..19].try_into().unwrap());
-                if (raw ^ FIXED_FORM) & (DIGIT_HIGH | FIXED_BYTES) != 0 {
-                    return None;
+            if clock[19] == b'Z' {
+                let prefix = clock[..11].try_into().unwrap();
+                if let Some(midnight) = self.matching_midnight(prefix) {
+                    let seconds = midnight + clock_seconds(clock[11..19].try_into().unwrap())?;
+                    let code = if seconds as u64 >= 1u64 << 31 {
+                        Self::DEFER_CODE
+                    } else {
+                        seconds as u32
+                    };
+                    return Some((seconds * 1000, code));
                 }
-                let h1 = raw & 15;
-                let h2 = (raw >> 8) & 15;
-                let m1 = (raw >> 24) & 15;
-                let m2 = (raw >> 32) & 15;
-                let s1 = (raw >> 48) & 15;
-                let s2 = raw >> 56 & 15;
-                let hours = h1 * 10 + h2;
-                if hours > 23 || m1 > 5 || s1 > 5 || h2.max(m2).max(s2) > 9 {
-                    return None;
+            }
+        } else if let Ok(clock) = <&[u8; 25]>::try_from(bytes) {
+            let prefix = clock[..11].try_into().unwrap();
+            if let (sign @ (b'+' | b'-'), b':') = (clock[19], clock[22]) {
+                if let Some(midnight) = self.matching_midnight(prefix) {
+                    let seconds = clock_seconds(clock[11..19].try_into().unwrap())?;
+                    let hour = pair(&clock[20..])?;
+                    let minute = pair(&clock[23..])?;
+                    if hour > 23 || minute > 59 {
+                        return None;
+                    }
+                    let zone = (hour * 3600 + minute * 60) * if sign == b'+' { 1 } else { -1 };
+                    return Some(((midnight + seconds - zone) * 1000, Self::DEFER_CODE));
                 }
-                let seconds = hours * 3600 + m1 * 600 + m2 * 60 + s1 * 10 + s2;
-                let seconds = midnight + seconds as i64;
-                let code = if seconds as u64 >= 1u64 << 31 {
-                    Self::DEFER_CODE
-                } else {
-                    seconds as u32
-                };
-                return Some((seconds * 1000, code));
             }
         }
         timestamp(bytes).map(|millis| (millis, Self::DEFER_CODE))
@@ -579,7 +849,204 @@ pub fn display_day(day: i32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fields, scalar_fields};
+    use super::{DAY, IngestCalendar, Table, event_row_fields, fields, file_waves, scalar_fields, timestamp, unsigned};
+
+    #[test]
+    fn cold_file_waves_schedule_distinct_files_and_preserve_physical_rows() {
+        let root = std::env::temp_dir().join(format!("shopping-cold-file-waves-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let long = "z".repeat(333);
+        let inputs = [
+            format!("header\na,b,c\n{long}\nlast without LF"),
+            "header\nempty,,,\nleft\nright\n".to_owned(),
+            "header\nsmall\n".to_owned(),
+            "header\n".to_owned(),
+            "unterminated header".to_owned(),
+        ];
+        for (index, input) in inputs.iter().enumerate() {
+            std::fs::write(root.join(format!("part-{index}.csv")), input).unwrap();
+        }
+        let table = Table::open(&root).unwrap();
+        let chunks = table.chunks_sized(8);
+        for width in [1, 2, 3, 8] {
+            let waves = file_waves(&chunks, width);
+            assert_eq!(chunks.len(), waves.len());
+            let first_wave: std::collections::HashSet<_> = waves.iter().take(width.min(3))
+                .map(|chunk| chunk.file).collect();
+            assert_eq!(first_wave.len(), width.min(3));
+            for (file, input) in inputs.iter().enumerate() {
+                let expected = input.split_once('\n').map_or(b"".as_slice(), |(_, data)| data.as_bytes());
+                let actual: Vec<_> = waves.iter().filter(|chunk| chunk.file == file)
+                    .flat_map(|chunk| &table.files[file].bytes()[chunk.start..chunk.end]).copied().collect();
+                assert_eq!(actual, expected);
+            }
+        }
+        drop(table);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn split_mask_preserves_separators_and_wrappers_at_block_edges() {
+        for second in 28..=34 {
+            for third in second + 1..=39 {
+                for fifth in 62..=65 {
+                    let stops = [9, second, third, 49, fifth, 72, 83];
+                    for wrapped in 0..128 {
+                        let mut row = [b'x'; 128];
+                        let mut start = 0;
+                        for (field, stop) in stops.into_iter().enumerate() {
+                            row[stop] = if field == 6 { b'\n' } else { b',' };
+                            if wrapped & (1 << field) != 0 && start < stop {
+                                row[start] = b'"';
+                                row[stop - 1] = b'"';
+                            }
+                            start = stop + 1;
+                        }
+                        let expected = scalar_fields::<7>(&row[..83]);
+                        let result = event_row_fields(&row);
+                        assert_eq!(result, (84, expected));
+                        if let (Some(actual), Some(expected)) = (result.1, expected) {
+                            for (actual, expected) in actual.into_iter().zip(expected) {
+                                assert_eq!(actual.as_ptr(), expected.as_ptr());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fused_event_fields_preserve_all_physical_boundaries() {
+        let tail = b"\"new\",\"\"\nshort,no,end-with-delimiters,,,,\n";
+        for padding in 0..180 {
+            for head in [b",,,,,,".as_slice(), b"\"id\",user,\"\",at,kind,p,",
+                         b"x,y,\"bad,z,d,p,", b"", b"a,b,c,d,e,f,g,extra"] {
+                let mut line = head.to_vec();
+                line.resize(line.len() + padding, b'x');
+                for corruption in [None, Some(b','), Some(b'"'), Some(b'\r')] {
+                    let mut row = line.clone();
+                    if let Some(value) = corruption {
+                        if let Some(byte) = row.get_mut(padding / 2) {
+                            *byte = value;
+                        }
+                    }
+                    let mut input = row.clone();
+                    input.push(b'\n');
+                    input.extend(tail.repeat(4));
+                    assert_eq!(event_row_fields(&input), (row.len() + 1, scalar_fields::<7>(&row)));
+                    assert_eq!(event_row_fields(&row), (row.len(), scalar_fields::<7>(&row)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decimal_epoch_matches_general_digit_parser() {
+        for digit in 0..=9 {
+            let digits = [b'0' + digit; 13];
+            for index in 0..digits.len() {
+                for byte in 0..=u8::MAX {
+                    let mut changed = digits;
+                    changed[index] = byte;
+                    assert_eq!(timestamp(&changed), unsigned(&changed));
+                }
+            }
+        }
+        let mut random = 0x9be7_4531_62d4_180fu64;
+        for _ in 0..8192 {
+            let mut digits = [0; 13];
+            for digit in &mut digits {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                *digit = b'0' + (random % 10) as u8;
+            }
+            assert_eq!(timestamp(&digits), unsigned(&digits));
+        }
+        for digits in [
+            b"000000000007".as_slice(),
+            b"00000000000007",
+            b"000001791071890000",
+            b"9223372036854775807",
+            b"9223372036854775808",
+        ] {
+            assert_eq!(timestamp(digits), unsigned(digits));
+        }
+    }
+
+    #[test]
+    fn cached_clock_table_matches_full_calendar() {
+        let start = timestamp(b"2028-02-28T00:00:00Z").unwrap();
+        let calendar = IngestCalendar::new(start, start + 14 * DAY);
+        for hour in 0..=24 {
+            for minute in 0..=60 {
+                for second in 0..=60 {
+                    let value = format!("2028-02-29T{hour:02}:{minute:02}:{second:02}Z");
+                    let bytes = value.as_bytes();
+                    assert_eq!(calendar.parse(bytes).map(|(millis, _)| millis), timestamp(bytes));
+                }
+            }
+        }
+        for date in ["2028-02-29", "2028-03-08", "2028-02-14", "2028-02-30", "1970-01-01"] {
+            for clock in ["00:00:00", "19:01:59", "23:59:59", "24:00:00", "12:1;:00"] {
+                for zone in ["+00:00", "-00:00", "-23:59", "+23:59", "+24:00", "+15:60", "-12=00"] {
+                    let input = format!("{date}T{clock}{zone}");
+                    let bytes = input.as_bytes();
+                    assert_eq!(calendar.parse(bytes).map(|(millis, _)| millis), timestamp(bytes));
+                }
+            }
+        }
+        for (seed, width) in [(b"2028-02-29T09:38:57Z".as_slice(), 20),
+                              (b"2028-02-29T09:38:57-15:26".as_slice(), 25)] {
+            for index in 0..width {
+                for byte in 0..=u8::MAX {
+                    let mut changed = seed.to_vec();
+                    changed[index] = byte;
+                    assert_eq!(calendar.parse(&changed).map(|(millis, _)| millis), timestamp(&changed));
+                }
+            }
+        }
+        let last_inline = timestamp(b"2038-01-19T03:14:07Z").unwrap();
+        let calendar = IngestCalendar::new(last_inline, last_inline + DAY);
+        assert_eq!(calendar.parse(b"2038-01-19T03:14:07Z"), Some((last_inline, i32::MAX as u32)));
+        assert_eq!(calendar.parse(b"2038-01-19T03:14:08Z"), Some((last_inline + 1000, IngestCalendar::DEFER_CODE)));
+    }
+
+    #[test]
+    fn scanner_matches_scalar_for_empty_cells_and_endpoint_quotes() {
+        for row_size in 15usize..=131 {
+            for quoted in 0..128u8 {
+                let Some(payload) = row_size.checked_sub(6 + 2 * quoted.count_ones() as usize) else {
+                    continue;
+                };
+                let mut line = Vec::with_capacity(row_size);
+                for field in 0..7 {
+                    if field != 0 {
+                        line.push(b',');
+                    }
+                    let wrap = quoted >> field & 1 != 0;
+                    if wrap {
+                        line.push(b'"');
+                    }
+                    // Put the payload before empty cells, so successive
+                    // delimiters and quoted empties also exercise the tail.
+                    if field == row_size % 7 {
+                        line.resize(line.len() + payload, b'x');
+                    }
+                    if wrap {
+                        line.push(b'"');
+                    }
+                }
+                assert_eq!(fields::<7>(&line), scalar_fields::<7>(&line));
+                for index in [0, line.len() / 2, line.len() - 1] {
+                    let mut malformed = line.clone();
+                    malformed[index] = b'"';
+                    assert_eq!(fields::<7>(&malformed), scalar_fields::<7>(&malformed));
+                }
+            }
+        }
+    }
 
     #[test]
     fn delimiter_scanner_matches_scalar() {
