@@ -4,7 +4,7 @@ mod input;
 mod output;
 
 use identities::{Identities, Name, unpack};
-use input::{DAY, Map, SHARDS, Table, WEEK, fields, first_field, hash_bytes, mix, shard, timestamp, transpose, unsigned, worker_map};
+use input::{DAY, IngestCalendar, Map, SHARDS, Table, WEEK, fields, first_field, hash_bytes, mix, shard, timestamp, transpose, unsigned, worker_map};
 use std::collections::hash_map::Entry;
 use std::env;
 use std::fs;
@@ -270,11 +270,11 @@ impl DuplicateFilter {
 }
 
 fn prepare_event<'a, E: EventRecord>(
-    line: &'a [u8], identities: &Identities<'a>, catalog: &Catalog<'a>, window: Window,
+    line: &'a [u8], identities: &Identities<'a>, catalog: &Catalog<'a>, window: Window, calendar: &IngestCalendar,
 ) -> Option<(&'a [u8], EarlyCopy<'a, E>)> {
     let [id, user, at, ingest, kind, product, price] = fields(line)?;
     if id.is_empty() { return None; }
-    let ingest = timestamp(ingest)?;
+    let ingest = calendar.parse(ingest)?;
     // Invalid copies remain in the dedup stage as tombstones. In particular,
     // a valid later copy must never rescue an invalid earliest copy.
     let row = prepare_event_row(user, at, ingest, kind, product, price, identities, catalog, window)
@@ -308,8 +308,9 @@ fn load_events<'a, E: EventRecord>(
     let filter = DuplicateFilter::build(table, b'e', threads);
     eprintln!("event duplicate filter {:.3}s", stage.elapsed().as_secs_f64());
     let stage = Instant::now();
+    let calendar = IngestCalendar::new(window.start, window.end);
     let workers = table.scan(threads, Candidates::new, |worker, line| {
-        if let Some((id, candidate)) = prepare_event(line, identities, catalog, window) {
+        if let Some((id, candidate)) = prepare_event(line, identities, catalog, window, &calendar) {
             let key = ExactKey::new(id, b'e');
             let hash = key.fingerprint();
             let bucket = shard(hash);

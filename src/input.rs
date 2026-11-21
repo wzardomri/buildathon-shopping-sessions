@@ -111,7 +111,7 @@ fn scalar_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     Some(values)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(target_feature = "bmi2")))]
 fn scanned_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     let (mut commas, mut quotes) = delimiter_masks(line);
     if commas.count_ones() as usize != N - 1 {
@@ -130,6 +130,56 @@ fn scanned_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
             return None;
         };
         quotes ^= in_field;
+        commas &= commas.wrapping_sub(1);
+        start = stop + 1;
+    }
+    Some(values)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+#[inline]
+fn bits_at_commas(bits: u128, commas: u128) -> u64 {
+    use std::arch::x86_64::_pext_u64;
+
+    let low = commas as u64;
+    let high = (commas >> 64) as u64;
+    // The scanner checks the small, fixed number of commas before this call.
+    let below = unsafe { _pext_u64(bits as u64, low) };
+    let above = unsafe { _pext_u64((bits >> 64) as u64, high) };
+    below | (above << low.count_ones())
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+fn scanned_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
+    let (mut commas, quotes) = delimiter_masks(line);
+    if commas.count_ones() as usize != N - 1 {
+        return None;
+    }
+    let mut wrapped = 0;
+    if quotes != 0 {
+        let end = 1u128 << (line.len() - 1);
+        let opens = quotes & ((commas << 1) | 1);
+        let closes = quotes & ((commas >> 1) | end);
+        // A quote can only be the first or last byte of a field. A single
+        // quote cannot count as both the opening and closing byte.
+        if opens | closes != quotes || opens & closes != 0 {
+            return None;
+        }
+        // Extract the quote flags in field order, aligning opening quotes with
+        // the preceding commas and closing quotes with the following commas.
+        wrapped = (bits_at_commas(opens >> 1, commas) << 1) | (opens as u64 & 1);
+        let closed = bits_at_commas(closes << 1, commas) | (u64::from(closes & end != 0) << (N - 1));
+        if wrapped != closed {
+            return None;
+        }
+    }
+    let mut values = [b"".as_slice(); N];
+    let mut start = 0;
+    for value in &mut values {
+        let stop = if commas == 0 { line.len() } else { commas.trailing_zeros() as usize };
+        let padding = (wrapped as usize) & 1;
+        *value = &line[start + padding..stop - padding];
+        wrapped >>= 1;
         commas &= commas.wrapping_sub(1);
         start = stop + 1;
     }
@@ -429,6 +479,62 @@ pub fn timestamp(bytes: &[u8]) -> Option<i64> {
     let start_of_month = YEAR_START[year as usize] + MONTH_START[month as usize - 1];
     let days = start_of_month + day - 1 + i64::from(leap && month > 2);
     Some(days * DAY + ((hour * 60 + minute - offset) * 60 + second) * 1000)
+}
+
+pub struct IngestCalendar {
+    days: [([u8; 11], i64); 64],
+}
+
+impl IngestCalendar {
+    fn bucket(prefix: &[u8; 11]) -> usize {
+        (usize::from(prefix[8]) * 10 + usize::from(prefix[9]) + (usize::from(prefix[6]) << 5)) & 63
+    }
+
+    pub fn new(window_start: i64, window_end: i64) -> Self {
+        let mut days = [([0; 11], 0); 64];
+        let start = window_start.div_euclid(DAY);
+        let end = window_end.div_euclid(DAY);
+        for day in (start - 1).max(YEAR_START[1])..=(end + 5).min(start + 30) {
+            if let Ok(day) = i32::try_from(day) {
+                let mut label = display_day(day);
+                label.push('T');
+                if let Ok(prefix) = <[u8; 11]>::try_from(label.as_bytes()) {
+                    days[Self::bucket(&prefix)] = (prefix, i64::from(day) * DAY);
+                }
+            }
+        }
+        Self { days }
+    }
+
+    #[inline]
+    pub fn parse(&self, bytes: &[u8]) -> Option<i64> {
+        if let Ok(clock) = <&[u8; 20]>::try_from(bytes) {
+            let prefix = <&[u8; 11]>::try_from(&clock[..11]).unwrap();
+            let (expected, midnight) = &self.days[Self::bucket(prefix)];
+            if prefix == expected && clock[19] == b'Z' {
+                const DIGIT_HIGH: u64 = 0xf0f0_00f0_f000_f0f0;
+                const FIXED_BYTES: u64 = 0x0000_ff00_00ff_0000;
+                const FIXED_FORM: u64 = u64::from_le_bytes(*b"00:00:00");
+                let raw = u64::from_le_bytes(clock[11..19].try_into().unwrap());
+                if (raw ^ FIXED_FORM) & (DIGIT_HIGH | FIXED_BYTES) != 0 {
+                    return None;
+                }
+                let h1 = raw & 15;
+                let h2 = (raw >> 8) & 15;
+                let m1 = (raw >> 24) & 15;
+                let m2 = (raw >> 32) & 15;
+                let s1 = (raw >> 48) & 15;
+                let s2 = raw >> 56 & 15;
+                let hours = h1 * 10 + h2;
+                if hours > 23 || m1 > 5 || s1 > 5 || h2.max(m2).max(s2) > 9 {
+                    return None;
+                }
+                let seconds = hours * 3600 + m1 * 600 + m2 * 60 + s1 * 10 + s2;
+                return Some(midnight + seconds as i64 * 1000);
+            }
+        }
+        timestamp(bytes)
+    }
 }
 
 const MONTH_START: [i64; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
