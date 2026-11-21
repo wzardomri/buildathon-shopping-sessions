@@ -302,11 +302,8 @@ fn prepare_event_row<'a, E: EventRecord>(
 
 fn load_events<'a, E: EventRecord>(
     table: &'a Table, identities: &Identities<'a>, catalog: &Catalog<'a>,
-    window: Window, threads: usize,
+    window: Window, threads: usize, filter: DuplicateFilter,
 ) -> Vec<group::Batch<'a, E>> {
-    let stage = Instant::now();
-    let filter = DuplicateFilter::build(table, b'e', threads);
-    eprintln!("event duplicate filter {:.3}s", stage.elapsed().as_secs_f64());
     let stage = Instant::now();
     let workers = table.scan(threads, Candidates::new, |worker, line| {
         if let Some((id, candidate)) = prepare_event(line, identities, catalog, window) {
@@ -357,53 +354,28 @@ fn select_events<'a, K: Hash + Eq + Copy, E: Copy>(
 
 fn prepare_click<'a>(
     line: &'a [u8], identities: &Identities<'a>, catalog: &Catalog<'a>, window: Window,
-) -> Option<(&'a [u8], ClickRow<'a>)> {
+) -> Option<ClickRow<'a>> {
     let [id, user, campaign, at] = fields(line)?;
     if id.is_empty() || user.is_empty() { return None; }
     let campaign = *catalog.campaigns.get(campaign)?;
     let at = timestamp(at).filter(|&at| at >= window.start - WEEK && at < window.end)?;
     let user = identities.name(user);
-    Some((id, ClickRow { user, click: Click { at, id, campaign } }))
+    Some(ClickRow { user, click: Click { at, id, campaign } })
 }
 
 fn load_clicks<'a>(
     table: &'a Table, identities: &Identities<'a>, catalog: &Catalog<'a>,
     window: Window, threads: usize,
 ) -> Vec<group::Batch<'a, Click<'a>>> {
-    let filter = DuplicateFilter::build(table, b'k', threads);
-    let workers = table.scan(threads, Candidates::new, |worker, line| {
-        if let Some((id, row)) = prepare_click(line, identities, catalog, window) {
-            let key = ExactKey::new(id, b'k');
-            let hash = key.fingerprint();
-            let bucket = shard(hash);
-            if filter.maybe_repeated(bucket, hash) {
-                worker.duplicates.push(key, bucket, row);
-            } else {
-                worker.output.push(row.user, row.click);
-            }
+    // Copies of a click have identical decoded values. They give the same
+    // latest-click candidate and the same assist interval, so retaining them
+    // leaves both outputs exactly the same as explicit deduplication.
+    let workers = table.scan(threads, group::Rows::new, |worker, line| {
+        if let Some(row) = prepare_click(line, identities, catalog, window) {
+            worker.push(row.user, row.click);
         }
     });
-    let (parts, mut output): (Vec<_>, Vec<_>) = workers.into_iter().map(|worker| (worker.duplicates, worker.output)).unzip();
-    let parts = dedup_jobs(parts);
-    let workers = worker_map(threads, parts.len(), group::Rows::new, |loaded, index| {
-        let (packed, fallback) = std::mem::take(&mut *parts[index].lock().unwrap());
-        select_clicks(packed, loaded);
-        select_clicks(fallback, loaded);
-    });
-    output.extend(workers);
-    group::batch(output)
-}
-
-fn select_clicks<'a, K: Hash + Eq>(parts: Vec<Vec<(K, ClickRow<'a>)>>, loaded: &mut group::Rows<'a, Click<'a>>) {
-    let count = parts.iter().map(Vec::len).sum::<usize>();
-    let mut seen = Map::with_capacity_and_hasher(count, Default::default());
-    // Duplicate click copies are identical. Filtering before this set is
-    // equivalent to filtering the surviving copy.
-    for (key, row) in parts.into_iter().flatten() {
-        if seen.insert(key, ()).is_none() {
-            loaded.push(row.user, row.click);
-        }
-    }
+    group::batch(workers)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -618,21 +590,33 @@ fn solve(data: &Path, scratch: &Path, threads: usize) -> io::Result<()> {
     let campaigns = Table::open(&data.join("campaigns.csv"))?;
     let events = Table::open(&data.join("events"))?;
     let clicks = Table::open(&data.join("clicks"))?;
-    let identities = Identities::read(&links);
-    let catalog = Catalog::read(&products, &campaigns);
-    eprintln!("load linked identities {:.3}s", stage.elapsed().as_secs_f64());
-    if PackedEvent::fits(window, catalog.categories.len()) {
-        solve_tables::<PackedEvent>(&events, &clicks, &identities, &catalog, window, scratch, threads)
+    let (identities, catalog, event_filter) = if threads == 1 {
+        (
+            Identities::read(&links),
+            Catalog::read(&products, &campaigns),
+            DuplicateFilter::build(&events, b'e', 1),
+        )
     } else {
-        solve_tables::<Event>(&events, &clicks, &identities, &catalog, window, scratch, threads)
+        std::thread::scope(|scope| {
+            let filter = scope.spawn(|| DuplicateFilter::build(&events, b'e', threads - 1));
+            let identities = Identities::read(&links);
+            let catalog = Catalog::read(&products, &campaigns);
+            (identities, catalog, filter.join().expect("event duplicate filter failed"))
+        })
+    };
+    eprintln!("identities and filter  {:.3}s", stage.elapsed().as_secs_f64());
+    if PackedEvent::fits(window, catalog.categories.len()) {
+        solve_tables::<PackedEvent>(&events, &clicks, &identities, &catalog, window, scratch, threads, event_filter)
+    } else {
+        solve_tables::<Event>(&events, &clicks, &identities, &catalog, window, scratch, threads, event_filter)
     }
 }
 
 fn solve_tables<E: EventRecord>(
     events: &Table, clicks: &Table, identities: &Identities<'_>, catalog: &Catalog<'_>,
-    window: Window, scratch: &Path, threads: usize,
+    window: Window, scratch: &Path, threads: usize, event_filter: DuplicateFilter,
 ) -> io::Result<()> {
-    let events = load_events::<E>(events, identities, catalog, window, threads);
+    let events = load_events::<E>(events, identities, catalog, window, threads, event_filter);
     let stage = Instant::now();
     let clicks = load_clicks(clicks, identities, catalog, window, threads);
     eprintln!("partition clicks       {:.3}s", stage.elapsed().as_secs_f64());
