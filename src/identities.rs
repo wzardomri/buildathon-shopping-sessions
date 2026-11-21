@@ -32,16 +32,23 @@ fn packed(id: &[u8]) -> Option<u64> {
     Some(spread(u64::from_le_bytes(bytes) | case))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Name<'a> {
     Packed(u64),
     Full(&'a [u8]),
 }
 
 impl<'a> Name<'a> {
-    #[cfg(test)]
     pub fn from_bytes(bytes: &'a [u8]) -> Self {
         packed(bytes).map_or(Self::Full(bytes), Self::Packed)
+    }
+
+    #[inline]
+    pub fn shard(self) -> usize {
+        match self {
+            Self::Packed(key) => packed_shard(key),
+            Self::Full(key) => shard(hash_bytes(key)),
+        }
     }
 
     fn lexical_min(self, other: Self) -> Self {
@@ -301,18 +308,20 @@ impl<'a> Identities<'a> {
     }
 
     #[inline]
-    pub fn name(&self, key: &'a [u8]) -> Name<'a> {
-        if let Some(bits) = packed(key) {
-            let bucket = packed_shard(bits);
-            if let Some(&owner) = self.packed[bucket].get(&bits) {
-                return Name::Packed(owner);
+    pub fn canonical(&self, raw: Name<'a>) -> Name<'a> {
+        let bucket = raw.shard();
+        match raw {
+            Name::Packed(bits) => {
+                if let Some(&owner) = self.packed[bucket].get(&bits) {
+                    return Name::Packed(owner);
+                }
+                if let Some(&owner) = self.packed_full.as_ref().and_then(|maps| maps[bucket].get(&bits)) {
+                    return Name::Full(owner);
+                }
+                raw
             }
-            if let Some(&owner) = self.packed_full.as_ref().and_then(|maps| maps[bucket].get(&bits)) {
-                return Name::Full(owner);
-            }
-            return Name::Packed(bits);
+            Name::Full(key) => self.full[bucket].get(key).copied().unwrap_or(raw),
         }
-        self.full[shard(hash_bytes(key))].get(key).copied().unwrap_or(Name::Full(key))
     }
 }
 

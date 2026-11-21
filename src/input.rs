@@ -11,6 +11,7 @@ use std::thread;
 pub const DAY: i64 = 86_400_000;
 pub const WEEK: i64 = 7 * DAY;
 pub const SHARDS: usize = 128;
+pub const CHUNK_BYTES: usize = 4 << 20;
 
 unsafe extern "C" {
     fn mmap(address: *mut c_void, len: usize, protection: i32, flags: i32, fd: i32, offset: i64) -> *mut c_void;
@@ -284,7 +285,6 @@ impl Table {
     }
 
     fn chunks(&self) -> Vec<Chunk> {
-        const CHUNK_BYTES: usize = 4 << 20;
         let mut chunks = vec![];
         for (file, mapping) in self.files.iter().enumerate() {
             let bytes = mapping.bytes();

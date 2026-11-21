@@ -6,7 +6,7 @@ mod output;
 
 use click::{Click, ClickRecord, PackedClick};
 use identities::{Identities, Name, unpack};
-use input::{DAY, IngestCalendar, Map, SHARDS, Table, WEEK, fields, find, first_field, hash_bytes, mix, shard, timestamp, transpose, unsigned, worker_map};
+use input::{CHUNK_BYTES, DAY, IngestCalendar, Map, SHARDS, Table, WEEK, fields, find, first_field, hash_bytes, mix, shard, timestamp, transpose, unsigned, worker_map};
 use std::collections::hash_map::Entry;
 use std::env;
 use std::fs;
@@ -131,9 +131,6 @@ impl EventRecord for PackedEvent {
 #[derive(Clone, Copy)]
 struct EventRow<'a, E> { user: Name<'a>, event: E }
 
-#[derive(Clone, Copy)]
-struct ClickRow<'a, C> { user: Name<'a>, click: C }
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Key<'a> { hash: u64, id: &'a [u8] }
 
@@ -161,20 +158,6 @@ fn packed_key(id: &[u8], prefix: u8) -> Option<u64> {
     Some(u64::from_le_bytes(bytes))
 }
 
-struct Partitions<K, V> {
-    packed: Vec<Vec<(u64, V)>>,
-    fallback: Vec<Vec<(K, V)>>,
-}
-
-impl<K, V> Partitions<K, V> {
-    fn new() -> Self {
-        Self {
-            packed: (0..SHARDS).map(|_| Vec::new()).collect(),
-            fallback: (0..SHARDS).map(|_| Vec::new()).collect(),
-        }
-    }
-}
-
 enum ExactKey<'a> { Packed(u64), Full(Key<'a>) }
 
 impl<'a> ExactKey<'a> {
@@ -191,81 +174,52 @@ impl<'a> ExactKey<'a> {
     }
 }
 
-impl<'a, V> Partitions<Key<'a>, V> {
-    fn push(&mut self, key: ExactKey<'a>, bucket: usize, value: V) {
-        match key {
-            ExactKey::Packed(key) => self.packed[bucket].push((key, value)),
-            ExactKey::Full(key) => self.fallback[bucket].push((key, value)),
-        }
-    }
-}
-
-fn dedup_jobs<K, V>(workers: Vec<Partitions<K, V>>) -> Vec<Mutex<(Vec<Vec<(u64, V)>>, Vec<Vec<(K, V)>>)>> {
-    let (packed, fallback): (Vec<_>, Vec<_>) = workers.into_iter().map(|worker| (worker.packed, worker.fallback)).unzip();
-    transpose(packed).into_iter().zip(transpose(fallback)).map(Mutex::new).collect()
-}
-
-struct Candidates<'a, V, R> {
-    duplicates: Partitions<Key<'a>, V>,
-    output: group::Rows<'a, R>,
-}
-
-impl<'a, V, R> Candidates<'a, V, R> {
-    fn new() -> Self { Self { duplicates: Partitions::new(), output: group::Rows::new() } }
-}
-
 fn buckets<T>() -> Vec<Vec<T>> { (0..SHARDS).map(|_| Vec::new()).collect() }
-
-struct DuplicateFilter { collisions: Vec<Vec<u64>> }
-
-impl DuplicateFilter {
-    fn build(table: &Table, prefix: u8, threads: usize) -> Self {
-        let hashes = transpose(table.scan(threads, buckets, |worker, line| {
-            if let Some(id) = first_field(line) {
-                let hash = ExactKey::new(id, prefix).fingerprint();
-                worker[shard(hash)].push(hash as u32);
-            }
-        }));
-        let results = worker_map(threads, hashes.len(), Vec::new, |worker, index| {
-            let hashes = &hashes[index];
-            let count = hashes.iter().map(Vec::len).sum::<usize>();
-            let mut repeated = vec![];
-            if count > 1 {
-                // The first pass can produce false positives from hash collisions or
-                // malformed rows. All repeated IDs necessarily share a bit, so a
-                // clear collision bit proves that the ID has at most one candidate.
-                let bits = (count * 12).next_power_of_two().max(64);
-                repeated = vec![0; bits / 64];
-                let mut seen = vec![0u64; bits / 64];
-                for &hash in hashes.iter().flatten() {
-                    let slot = (hash as usize) & (bits - 1);
-                    let word = slot >> 6;
-                    let mask = 1u64 << (slot & 63);
-                    repeated[word] |= seen[word] & mask;
-                    seen[word] |= mask;
-                }
-            }
-            worker.push((index, repeated));
-        });
-        let mut collisions = buckets();
-        for (index, repeated) in results.into_iter().flatten() {
-            collisions[index] = repeated;
-        }
-        Self { collisions }
-    }
-
-    fn maybe_repeated(&self, bucket: usize, fingerprint: u64) -> bool {
-        let bits = &self.collisions[bucket];
-        if bits.is_empty() { return false; }
-        let slot = (fingerprint as u32 as usize) & (bits.len() * 64 - 1);
-        bits[slot >> 6] & (1 << (slot & 63)) != 0
-    }
-}
 
 #[derive(Clone, Copy)]
 struct Position {
     chunk: u32,
     offset: u32,
+}
+
+// Table chunks can extend through one final row, whose starting offset can
+// be exactly CHUNK_BYTES. The remaining bits address a worker-local chunk.
+const OFFSET_BITS: u32 = usize::BITS - CHUNK_BYTES.leading_zeros();
+const OFFSET_MASK: u32 = (1 << OFFSET_BITS) - 1;
+const CHUNKS_PER_BATCH: usize = 1 << (u32::BITS - OFFSET_BITS);
+
+#[derive(Clone, Copy)]
+struct EventCandidate {
+    fingerprint: u32,
+    cursor: u32,
+}
+
+impl EventCandidate {
+    fn position(self, chunk_ids: &[u32]) -> Position {
+        Position { chunk: chunk_ids[(self.cursor >> OFFSET_BITS) as usize], offset: self.cursor & OFFSET_MASK }
+    }
+}
+
+struct EventBatch {
+    chunk_ids: Vec<u32>,
+    shards: Vec<Vec<EventCandidate>>,
+}
+
+impl EventBatch {
+    fn new() -> Self {
+        Self { chunk_ids: Vec::new(), shards: buckets() }
+    }
+
+    fn scan(&mut self, index: usize, bytes: &[u8]) {
+        let chunk_code = (self.chunk_ids.len() as u32) << OFFSET_BITS;
+        self.chunk_ids.push(u32::try_from(index).expect("too many event file segments"));
+        for (offset, line) in physical_rows(bytes) {
+            if let Some(id) = first_field(line) {
+                let hash = ExactKey::new(id, b'e').fingerprint();
+                self.shards[shard(hash)].push(EventCandidate { fingerprint: hash as u32, cursor: chunk_code | offset });
+            }
+        }
+    }
 }
 
 struct EventPlan<'a> {
@@ -292,24 +246,26 @@ fn physical_rows(bytes: &[u8]) -> impl Iterator<Item = (u32, &[u8])> {
 impl<'a> EventPlan<'a> {
     fn build(table: &'a Table, calendar: &IngestCalendar, threads: usize) -> Self {
         let chunks = table.data_chunks();
-        let workers = worker_map(threads, chunks.len(), Partitions::new, |worker, index| {
-            let chunk = u32::try_from(index).expect("too many event file segments");
-            for (offset, line) in physical_rows(chunks[index]) {
-                if let Some(id) = first_field(line) {
-                    let key = ExactKey::new(id, b'e');
-                    let bucket = shard(key.fingerprint());
-                    worker.push(key, bucket, Position { chunk, offset });
+        let workers = worker_map(threads, chunks.len(), || vec![EventBatch::new()], |batches, index| {
+            if batches.last().unwrap().chunk_ids.len() == CHUNKS_PER_BATCH {
+                batches.push(EventBatch::new());
+            }
+            batches.last_mut().unwrap().scan(index, chunks[index]);
+        });
+        let mut chunk_ids = Vec::new();
+        let mut parts: Vec<_> = (0..SHARDS).map(|_| Mutex::new(Vec::new())).collect();
+        for EventBatch { chunk_ids: ids, shards } in workers.into_iter().flatten() {
+            let batch = chunk_ids.len();
+            chunk_ids.push(ids);
+            for (part, candidates) in parts.iter_mut().zip(shards) {
+                if !candidates.is_empty() {
+                    part.get_mut().unwrap().push((batch, candidates));
                 }
             }
-        });
-        let parts = dedup_jobs(workers);
+        }
         let skipped = worker_map(threads, parts.len(), Vec::new, |worker, index| {
-            let (packed, fallback) = std::mem::take(&mut *parts[index].lock().unwrap());
-            mark_losers(packed, |key| {
-                let hash = mix(0, key);
-                (hash ^ (hash >> 33)) as u32
-            }, &chunks, calendar, worker);
-            mark_losers(fallback, |key| (key.hash ^ (key.hash >> 33)) as u32, &chunks, calendar, worker);
+            let candidates = std::mem::take(&mut *parts[index].lock().unwrap());
+            mark_losers(candidates, &chunk_ids, &chunks, calendar, worker);
         });
         let mut by_chunk: Vec<Vec<_>> = (0..chunks.len()).map(|_| Vec::new()).collect();
         for position in skipped.into_iter().flatten() {
@@ -329,6 +285,12 @@ struct PendingEvent {
     ingest: Option<i64>,
 }
 
+fn event_id_at<'a>(position: Position, chunks: &[&'a [u8]]) -> &'a [u8] {
+    // Every candidate was screened with first_field on its own physical line.
+    // Therefore the first comma in this tail belongs to that line.
+    first_field(&chunks[position.chunk as usize][position.offset as usize..]).unwrap()
+}
+
 fn ingest_at(position: Position, chunks: &[&[u8]], calendar: &IngestCalendar) -> Option<i64> {
     let line = &chunks[position.chunk as usize][position.offset as usize..];
     let end = find(line, b'\n').unwrap_or(line.len());
@@ -336,72 +298,97 @@ fn ingest_at(position: Position, chunks: &[&[u8]], calendar: &IngestCalendar) ->
     calendar.parse(ingest)
 }
 
-fn mark_losers<K: Copy + Eq + Hash>(
-    parts: Vec<Vec<(K, Position)>>,
-    fingerprint: impl Fn(K) -> u32,
+fn mark_losers(
+    parts: Vec<(usize, Vec<EventCandidate>)>,
+    batch_chunks: &[Vec<u32>],
     chunks: &[&[u8]],
     calendar: &IngestCalendar,
     skipped: &mut Vec<Position>,
 ) {
-    let count = parts.iter().map(Vec::len).sum::<usize>();
+    let count = parts.iter().map(|(_, rows)| rows.len()).sum::<usize>();
     if count < 2 {
         return;
     }
     let size = (count * 12).next_power_of_two().max(64);
     let mut seen = vec![0u64; size / 64];
     let mut repeated = vec![0u64; size / 64];
-    let slot = |key| (fingerprint(key) as usize) & (size - 1);
-    for (key, _) in parts.iter().flatten() {
-        let bit = slot(*key);
+    let slot = |hash: u32| hash as usize & (size - 1);
+    for row in parts.iter().flat_map(|(_, rows)| rows) {
+        let bit = slot(row.fingerprint);
         let word = bit >> 6;
         let mask = 1u64 << (bit & 63);
         repeated[word] |= seen[word] & mask;
         seen[word] |= mask;
     }
-    let mut winners = Map::with_capacity_and_hasher(count / 6, Default::default());
-    for (key, position) in parts.into_iter().flatten() {
-        let bit = slot(key);
-        if repeated[bit >> 6] & (1 << (bit & 63)) == 0 {
-            continue;
-        }
-        match winners.entry(key) {
-            Entry::Vacant(entry) => {
-                entry.insert(PendingEvent { position, ingest: None });
+    let mut winners = Map::<u64, PendingEvent>::with_capacity_and_hasher(count / 6, Default::default());
+    let mut collisions = Map::<&[u8], PendingEvent>::default();
+    for (batch, rows) in parts {
+        let chunk_ids = &batch_chunks[batch];
+        for row in rows {
+            let bit = slot(row.fingerprint);
+            if repeated[bit >> 6] & (1 << (bit & 63)) == 0 {
+                continue;
             }
-            Entry::Occupied(mut entry) => {
-                // Only confirmed duplicate IDs need a second look at the CSV
-                // and ingest value. Do not validate time, type, or purchase
-                // fields here: an invalid earliest winner is a tombstone.
-                let Some(ingest) = ingest_at(position, chunks, calendar) else {
-                    skipped.push(position);
-                    continue;
-                };
-                let previous = entry.get_mut();
-                let old_ingest = previous.ingest.or_else(|| ingest_at(previous.position, chunks, calendar));
-                if old_ingest.is_none_or(|old| ingest < old) {
-                    skipped.push(previous.position);
-                    *previous = PendingEvent { position, ingest: Some(ingest) };
-                } else {
-                    skipped.push(position);
-                    previous.ingest = old_ingest;
+            let position = row.position(chunk_ids);
+            let pending = PendingEvent { position, ingest: None };
+            match winners.entry(u64::from(row.fingerprint)) {
+                Entry::Vacant(entry) => {
+                    entry.insert(pending);
+                }
+                Entry::Occupied(mut entry) => {
+                    let id = event_id_at(position, chunks);
+                    let previous = entry.get_mut();
+                    if id == event_id_at(previous.position, chunks) {
+                        keep_earliest(previous, position, chunks, calendar, skipped);
+                    } else {
+                        // Equal fingerprints can represent distinct IDs. The first
+                        // ID stays in the fingerprint map and the others use exact
+                        // spellings, so they each select their own winner.
+                        match collisions.entry(id) {
+                            Entry::Vacant(entry) => { entry.insert(pending); }
+                            Entry::Occupied(mut entry) => {
+                                keep_earliest(entry.get_mut(), position, chunks, calendar, skipped);
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 }
 
+fn keep_earliest(
+    previous: &mut PendingEvent, position: Position, chunks: &[&[u8]],
+    calendar: &IngestCalendar, skipped: &mut Vec<Position>,
+) {
+    // Only confirmed duplicate IDs need a second look at the CSV and ingest.
+    // Leave time, type and purchase validation for the chosen winner.
+    let Some(ingest) = ingest_at(position, chunks, calendar) else {
+        skipped.push(position);
+        return;
+    };
+    let old_ingest = previous.ingest.or_else(|| ingest_at(previous.position, chunks, calendar));
+    if old_ingest.is_none_or(|old| ingest < old) {
+        skipped.push(previous.position);
+        *previous = PendingEvent { position, ingest: Some(ingest) };
+    } else {
+        skipped.push(position);
+        previous.ingest = old_ingest;
+    }
+}
+
 fn prepare_event<'a, E: EventRecord>(
-    line: &'a [u8], identities: &Identities<'a>, catalog: &Catalog<'a>, window: Window, calendar: &IngestCalendar,
+    line: &'a [u8], catalog: &Catalog<'a>, window: Window, calendar: &IngestCalendar,
 ) -> Option<EventRow<'a, E>> {
     let [id, user, at, ingest, kind, product, price] = fields(line)?;
     if id.is_empty() { return None; }
     let ingest = calendar.parse(ingest)?;
-    prepare_event_row(user, at, ingest, kind, product, price, identities, catalog, window)
+    prepare_event_row(user, at, ingest, kind, product, price, catalog, window)
 }
 
 fn prepare_event_row<'a, E: EventRecord>(
     user: &'a [u8], at: &[u8], ingest: i64, kind: &[u8], product: &[u8], price: &[u8],
-    identities: &Identities<'a>, catalog: &Catalog<'a>, window: Window,
+    catalog: &Catalog<'a>, window: Window,
 ) -> Option<EventRow<'a, E>> {
     if user.is_empty() || product.is_empty() || !matches!(kind, b"purchase" | b"cart" | b"view") {
         return None;
@@ -414,11 +401,11 @@ fn prepare_event_row<'a, E: EventRecord>(
     } else {
         (0, 0)
     };
-    Some(EventRow { user: identities.name(user), event: E::encode(Event { at, price, category }, window.start) })
+    Some(EventRow { user: Name::from_bytes(user), event: E::encode(Event { at, price, category }, window.start) })
 }
 
 fn load_events<'a, E: EventRecord>(
-    table: &'a Table, identities: &Identities<'a>, catalog: &Catalog<'a>,
+    table: &'a Table, catalog: &Catalog<'a>,
     window: Window, threads: usize,
 ) -> Vec<group::Batch<'a, E>> {
     let stage = Instant::now();
@@ -431,7 +418,7 @@ fn load_events<'a, E: EventRecord>(
         for (offset, line) in physical_rows(plan.chunks[index]) {
             if skipped.peek() == Some(&offset) {
                 skipped.next();
-            } else if let Some(row) = prepare_event(line, identities, catalog, window, &calendar) {
+            } else if let Some(row) = prepare_event(line, catalog, window, &calendar) {
                 worker.push(row.user, row.event);
             }
         }
@@ -441,56 +428,29 @@ fn load_events<'a, E: EventRecord>(
 }
 
 fn prepare_click<'a, C: ClickRecord<'a>>(
-    line: &'a [u8], identities: &Identities<'a>, catalog: &Catalog<'a>, origin: i64, end: i64,
-) -> Option<(&'a [u8], ClickRow<'a, C>)> {
+    line: &'a [u8], catalog: &Catalog<'a>, origin: i64, end: i64,
+) -> Option<(Name<'a>, C)> {
     let [id, user, campaign, at] = fields(line)?;
     if id.is_empty() || user.is_empty() { return None; }
     let campaign = *catalog.campaigns.get(campaign)?;
     let at = timestamp(at).filter(|&at| at >= origin && at < end)?;
-    let user = identities.name(user);
-    Some((id, ClickRow { user, click: C::encode(Click { at, id, campaign }, origin) }))
+    let user = Name::from_bytes(user);
+    Some((user, C::encode(Click { at, id, campaign }, origin)))
 }
 
 fn load_clicks<'a, C: ClickRecord<'a>>(
-    table: &'a Table, identities: &Identities<'a>, catalog: &Catalog<'a>,
+    table: &'a Table, catalog: &Catalog<'a>,
     origin: i64, end: i64, threads: usize,
 ) -> Vec<group::Batch<'a, C>> {
-    let filter = DuplicateFilter::build(table, b'k', threads);
-    let workers = table.scan(threads, Candidates::new, |worker, line| {
-        if let Some((id, row)) = prepare_click::<C>(line, identities, catalog, origin, end) {
-            let key = ExactKey::new(id, b'k');
-            let hash = key.fingerprint();
-            let bucket = shard(hash);
-            if filter.maybe_repeated(bucket, hash) {
-                worker.duplicates.push(key, bucket, row);
-            } else {
-                worker.output.push(row.user, row.click);
-            }
+    // The rules guarantee identical values for each repeated click ID. Giving
+    // its copies to the same reducer preserves the winning timestamp and ID
+    // and leaves the union of campaign assist intervals unchanged.
+    let workers = table.scan(threads, group::Rows::new, |rows, line| {
+        if let Some((person, click)) = prepare_click::<C>(line, catalog, origin, end) {
+            rows.push(person, click);
         }
     });
-    let (parts, mut output): (Vec<_>, Vec<_>) = workers.into_iter().map(|worker| (worker.duplicates, worker.output)).unzip();
-    let parts = dedup_jobs(parts);
-    let workers = worker_map(threads, parts.len(), group::Rows::new, |loaded, index| {
-        let (packed, fallback) = std::mem::take(&mut *parts[index].lock().unwrap());
-        select_clicks(packed, loaded);
-        select_clicks(fallback, loaded);
-    });
-    output.extend(workers);
-    group::batch(output)
-}
-
-fn select_clicks<'a, K: Hash + Eq, C>(
-    parts: Vec<Vec<(K, ClickRow<'a, C>)>>, loaded: &mut group::Rows<'a, C>,
-) {
-    let count = parts.iter().map(Vec::len).sum::<usize>();
-    let mut seen = Map::with_capacity_and_hasher(count, Default::default());
-    // Duplicate click copies are identical. Filtering before this set is
-    // equivalent to filtering the surviving copy.
-    for (key, row) in parts.into_iter().flatten() {
-        if seen.insert(key, ()).is_none() {
-            loaded.push(row.user, row.click);
-        }
-    }
+    group::batch(workers)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -746,9 +706,9 @@ fn solve_tables<'a, E: EventRecord, C: ClickRecord<'a>>(
     scratch: &Path,
     threads: usize,
 ) -> io::Result<()> {
-    let events = load_events::<E>(events, identities, catalog, window, threads);
+    let events = load_events::<E>(events, catalog, window, threads);
     let stage = Instant::now();
-    let clicks = load_clicks::<C>(clicks, identities, catalog, click_origin, window.end, threads);
+    let clicks = load_clicks::<C>(clicks, catalog, click_origin, window.end, threads);
     eprintln!("partition clicks       {:.3}s", stage.elapsed().as_secs_f64());
     let stage = Instant::now();
     let mut jobs: Vec<_> = events.into_iter().zip(clicks).map(Mutex::new).collect();
@@ -756,16 +716,49 @@ fn solve_tables<'a, E: EventRecord, C: ClickRecord<'a>>(
         let (events, clicks) = &*job.lock().unwrap();
         std::cmp::Reverse(events.len() + clicks.len())
     });
-    let workers = worker_map(threads, jobs.len(), || Work::new(window, catalog.campaign_rows.len()), |work, job| {
+    let mut arenas: Vec<_> = worker_map(threads, jobs.len(), Vec::new, |arenas, job| {
         let (events, clicks) = std::mem::take(&mut *jobs[job].lock().unwrap());
+        arenas.push((
+            group::RawPeople::gather(events.packed, clicks.packed),
+            group::RawPeople::gather(events.full, clicks.full),
+        ));
+    }).into_iter().flatten().collect();
+    eprintln!("group raw names        {:.3}s", stage.elapsed().as_secs_f64());
+    let stage = Instant::now();
+
+    // Each raw owner has one disjoint event and click slice. Keep click-only
+    // names because another spelling of the same person may have the events.
+    let sources: Vec<_> = arenas.iter_mut().map(|arena| Mutex::new(Some(arena))).collect();
+    let routes = worker_map(threads, sources.len(), buckets, |routes, source| {
+        let (packed, full) = sources[source].lock().unwrap().take().unwrap();
+        let packed = packed.slabs().map(|(key, events, clicks)| (Name::Packed(key), events, clicks));
+        let full = full.slabs().map(|(key, events, clicks)| (Name::Full(key), events, clicks));
+        for (raw, events, clicks) in packed.chain(full) {
+            let owner = identities.canonical(raw);
+            routes[owner.shard()].push(group::Slab { owner, events, clicks });
+        }
+    });
+    drop(sources);
+    let mut jobs: Vec<_> = transpose(routes).into_iter().map(|parts| {
+        let rows: usize = parts.iter().flatten().map(|slab| slab.events.len() + slab.clicks.len()).sum();
+        (rows, Mutex::new(parts))
+    }).collect();
+    jobs.sort_unstable_by_key(|(rows, _)| std::cmp::Reverse(*rows));
+    eprintln!("route canonical owners {:.3}s", stage.elapsed().as_secs_f64());
+    let stage = Instant::now();
+    let workers = worker_map(threads, jobs.len(), || Work::new(window, catalog.campaign_rows.len()), |work, job| {
+        let parts = std::mem::take(&mut *jobs[job].1.lock().unwrap());
         let mut name = [0; 9];
-        group::people(events.packed, clicks.packed, |key, events, clicks| {
-            work.process(unpack(key, &mut name), events, clicks, catalog, window.start, click_origin);
-        });
-        group::people(events.full, clicks.full, |name, events, clicks| {
+        group::canonical_people(parts, |owner, events, clicks| {
+            let name = match owner {
+                Name::Packed(key) => unpack(key, &mut name),
+                Name::Full(key) => key,
+            };
             work.process(name, events, clicks, catalog, window.start, click_origin);
         });
     });
+    drop(jobs);
+    drop(arenas);
     eprintln!("sessions/attribution   {:.3}s", stage.elapsed().as_secs_f64());
     let stage = Instant::now();
     output::write(scratch, workers, catalog)?;
