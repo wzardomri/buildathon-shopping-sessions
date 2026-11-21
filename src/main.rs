@@ -6,7 +6,7 @@ mod output;
 
 use click::{Click, ClickRecord, PackedClick};
 use identities::{Identities, Name, unpack};
-use input::{CHUNK_BYTES, DAY, IngestCalendar, Map, SHARDS, Table, WEEK, fields, find, first_field, hash_bytes, mix, shard, timestamp, transpose, unsigned, worker_map};
+use input::{CHUNK_BYTES, DAY, IngestCalendar, Map, SHARDS, Table, WEEK, fields, find, hash_bytes, mix, shard, timestamp, transpose, unsigned, worker_map};
 use std::collections::hash_map::Entry;
 use std::env;
 use std::fs;
@@ -135,7 +135,7 @@ struct EventRow<'a, E> { user: Name<'a>, event: E }
 struct Key<'a> { hash: u64, id: &'a [u8] }
 
 impl<'a> Key<'a> {
-    fn new(id: &'a [u8]) -> Self { Self { hash: hash_bytes(id), id } }
+    fn new(id: &'a [u8]) -> Self { Self { hash: fold_hash(hash_bytes(id)), id } }
 }
 
 impl Hash for Key<'_> {
@@ -158,232 +158,149 @@ fn packed_key(id: &[u8], prefix: u8) -> Option<u64> {
     Some(u64::from_le_bytes(bytes))
 }
 
-enum ExactKey<'a> { Packed(u64), Full(Key<'a>) }
-
-impl<'a> ExactKey<'a> {
-    fn new(id: &'a [u8], prefix: u8) -> Self {
-        packed_key(id, prefix).map_or_else(|| Self::Full(Key::new(id)), Self::Packed)
-    }
-
-    fn fingerprint(&self) -> u64 {
-        let hash = match self {
-            Self::Packed(key) => mix(0, *key),
-            Self::Full(key) => key.hash,
-        };
-        hash ^ (hash >> 33)
-    }
-}
+#[inline]
+fn fold_hash(hash: u64) -> u64 { hash ^ (hash >> 33) }
 
 fn buckets<T>() -> Vec<Vec<T>> { (0..SHARDS).map(|_| Vec::new()).collect() }
 
-#[derive(Clone, Copy)]
-struct Position {
-    chunk: u32,
-    offset: u32,
-}
+const WIDE_INGEST: u32 = 1 << 31;
 
-// Table chunks can extend through one final row, whose starting offset can
-// be exactly CHUNK_BYTES. The remaining bits address a worker-local chunk.
-const OFFSET_BITS: u32 = usize::BITS - CHUNK_BYTES.leading_zeros();
-const OFFSET_MASK: u32 = (1 << OFFSET_BITS) - 1;
-const CHUNKS_PER_BATCH: usize = 1 << (u32::BITS - OFFSET_BITS);
-
-#[derive(Clone, Copy)]
-struct EventCandidate {
-    fingerprint: u32,
-    cursor: u32,
-}
-
-impl EventCandidate {
-    fn position(self, chunk_ids: &[u32]) -> Position {
-        Position { chunk: chunk_ids[(self.cursor >> OFFSET_BITS) as usize], offset: self.cursor & OFFSET_MASK }
+#[inline]
+fn pack_ingest(ingest: i64, wide: &mut Vec<i64>) -> u32 {
+    let seconds = ingest / 1000;
+    if (0..i64::from(WIDE_INGEST)).contains(&seconds) && ingest == seconds * 1000 {
+        seconds as u32
+    } else {
+        // A batch fits in the smaller packed output locator namespace, so
+        // even a batch containing only wide ingests cannot exhaust this one.
+        let index = wide.len() as u32;
+        wide.push(ingest);
+        WIDE_INGEST | index
     }
 }
 
-struct EventBatch {
-    chunk_ids: Vec<u32>,
-    shards: Vec<Vec<EventCandidate>>,
+#[derive(Clone, Copy)]
+struct Candidate {
+    location: u32,
+    ingest_code: u32,
 }
 
-impl EventBatch {
+impl Candidate {
+    fn ingest(self, wide: &[i64]) -> i64 {
+        if self.ingest_code & WIDE_INGEST == 0 {
+            i64::from(self.ingest_code) * 1000
+        } else {
+            wide[(self.ingest_code & !WIDE_INGEST) as usize]
+        }
+    }
+}
+
+struct FusedEventBatch<'a, E> {
+    packed: Vec<Vec<(u64, Candidate)>>,
+    full: Vec<Vec<(Key<'a>, Candidate)>>,
+    wide_ingests: Vec<i64>,
+    output: group::Rows<'a, E>,
+    candidates: usize,
+}
+
+impl<'a, E: EventRecord> FusedEventBatch<'a, E> {
     fn new() -> Self {
-        Self { chunk_ids: Vec::new(), shards: buckets() }
-    }
-
-    fn scan(&mut self, index: usize, bytes: &[u8]) {
-        let chunk_code = (self.chunk_ids.len() as u32) << OFFSET_BITS;
-        self.chunk_ids.push(u32::try_from(index).expect("too many event file segments"));
-        for (offset, line) in physical_rows(bytes) {
-            if let Some(id) = first_field(line) {
-                let hash = ExactKey::new(id, b'e').fingerprint();
-                self.shards[shard(hash)].push(EventCandidate { fingerprint: hash as u32, cursor: chunk_code | offset });
-            }
+        Self {
+            packed: buckets(),
+            full: buckets(),
+            wide_ingests: Vec::new(),
+            output: group::Rows::new(),
+            candidates: 0,
         }
     }
-}
 
-struct EventPlan<'a> {
-    chunks: Vec<&'a [u8]>,
-    skipped: Vec<Vec<u32>>,
-}
+    fn accepts_chunk(&self) -> bool {
+        // Table chunks end just after the next newline from CHUNK_BYTES. The
+        // last row can start at that offset, so it adds at most one more row.
+        self.candidates <= group::MAX_LOCATED_ROWS - CHUNK_BYTES - 1
+    }
 
-fn physical_rows(bytes: &[u8]) -> impl Iterator<Item = (u32, &[u8])> {
-    let mut offset = 0;
-    std::iter::from_fn(move || {
-        if offset >= bytes.len() {
-            return None;
-        }
-        let start = offset;
-        let remainder = &bytes[start..];
-        let len = find(remainder, b'\n').unwrap_or(remainder.len());
-        offset = start + len + 1;
-        // Chunking extends the 4 MiB target only through the final row.
-        // Even a long final row therefore starts within the compact range.
-        Some((u32::try_from(start).expect("invalid row offset"), &remainder[..len]))
-    })
-}
-
-impl<'a> EventPlan<'a> {
-    fn build(table: &'a Table, calendar: &IngestCalendar, threads: usize) -> Self {
-        let chunks = table.data_chunks();
-        let workers = worker_map(threads, chunks.len(), || vec![EventBatch::new()], |batches, index| {
-            if batches.last().unwrap().chunk_ids.len() == CHUNKS_PER_BATCH {
-                batches.push(EventBatch::new());
+    fn scan(
+        &mut self, mut bytes: &'a [u8], catalog: &Catalog<'a>, window: Window, calendar: &IngestCalendar,
+    ) {
+        while !bytes.is_empty() {
+            let end = find(bytes, b'\n').unwrap_or(bytes.len());
+            let line = &bytes[..end];
+            bytes = &bytes[(end + 1).min(bytes.len())..];
+            let Some([id, user, at, ingest, kind, product, price]) = fields(line) else { continue };
+            if id.is_empty() { continue; }
+            let Some(ingest) = calendar.parse(ingest) else { continue };
+            let location = match prepare_event_row::<E>(user, at, ingest, kind, product, price, catalog, window) {
+                Some(row) => self.output.push_located(row.user, row.event),
+                None => group::NO_LOCATION,
+            };
+            // Rows without valid event payloads still participate in dedup;
+            // the earliest copy can suppress valid rows with the same ID.
+            let candidate = Candidate { location, ingest_code: pack_ingest(ingest, &mut self.wide_ingests) };
+            if let Some(key) = packed_key(id, b'e') {
+                // Odd multiplication followed by xor-shift is reversible, so
+                // the full hash identifies a packed spelling without collision.
+                let hash = fold_hash(mix(0, key));
+                self.packed[shard(hash)].push((hash, candidate));
+            } else {
+                let key = Key::new(id);
+                self.full[shard(key.hash)].push((key, candidate));
             }
-            batches.last_mut().unwrap().scan(index, chunks[index]);
-        });
-        let mut chunk_ids = Vec::new();
-        let mut parts: Vec<_> = (0..SHARDS).map(|_| Mutex::new(Vec::new())).collect();
-        for EventBatch { chunk_ids: ids, shards } in workers.into_iter().flatten() {
-            let batch = chunk_ids.len();
-            chunk_ids.push(ids);
-            for (part, candidates) in parts.iter_mut().zip(shards) {
-                if !candidates.is_empty() {
-                    part.get_mut().unwrap().push((batch, candidates));
-                }
-            }
+            self.candidates += 1;
         }
-        let skipped = worker_map(threads, parts.len(), Vec::new, |worker, index| {
-            let candidates = std::mem::take(&mut *parts[index].lock().unwrap());
-            mark_losers(candidates, &chunk_ids, &chunks, calendar, worker);
-        });
-        let mut by_chunk: Vec<Vec<_>> = (0..chunks.len()).map(|_| Vec::new()).collect();
-        for position in skipped.into_iter().flatten() {
-            by_chunk[position.chunk as usize].push(position.offset);
-        }
-        for offsets in &mut by_chunk {
-            offsets.sort_unstable();
-        }
-        Self { chunks, skipped: by_chunk }
     }
 }
 
 #[derive(Clone, Copy)]
 struct PendingEvent {
-    position: Position,
-    // A singleton or a hash collision does not need a structure/ingest parse.
-    ingest: Option<i64>,
+    batch: u32,
+    location: u32,
+    ingest: i64,
 }
 
-fn event_id_at<'a>(position: Position, chunks: &[&'a [u8]]) -> &'a [u8] {
-    // Every candidate was screened with first_field on its own physical line.
-    // Therefore the first comma in this tail belongs to that line.
-    first_field(&chunks[position.chunk as usize][position.offset as usize..]).unwrap()
-}
-
-fn ingest_at(position: Position, chunks: &[&[u8]], calendar: &IngestCalendar) -> Option<i64> {
-    let line = &chunks[position.chunk as usize][position.offset as usize..];
-    let end = find(line, b'\n').unwrap_or(line.len());
-    let [_, _, _, ingest, _, _, _] = fields(&line[..end])?;
-    calendar.parse(ingest)
-}
-
-fn mark_losers(
-    parts: Vec<(usize, Vec<EventCandidate>)>,
-    batch_chunks: &[Vec<u32>],
-    chunks: &[&[u8]],
-    calendar: &IngestCalendar,
-    skipped: &mut Vec<Position>,
-) {
-    let count = parts.iter().map(|(_, rows)| rows.len()).sum::<usize>();
-    if count < 2 {
-        return;
-    }
-    let size = (count * 12).next_power_of_two().max(64);
-    let mut seen = vec![0u64; size / 64];
-    let mut repeated = vec![0u64; size / 64];
-    let slot = |hash: u32| hash as usize & (size - 1);
-    for row in parts.iter().flat_map(|(_, rows)| rows) {
-        let bit = slot(row.fingerprint);
-        let word = bit >> 6;
-        let mask = 1u64 << (bit & 63);
-        repeated[word] |= seen[word] & mask;
-        seen[word] |= mask;
-    }
-    let mut winners = Map::<u64, PendingEvent>::with_capacity_and_hasher(count / 6, Default::default());
-    let mut collisions = Map::<&[u8], PendingEvent>::default();
-    for (batch, rows) in parts {
-        let chunk_ids = &batch_chunks[batch];
-        for row in rows {
-            let bit = slot(row.fingerprint);
-            if repeated[bit >> 6] & (1 << (bit & 63)) == 0 {
-                continue;
-            }
-            let position = row.position(chunk_ids);
-            let pending = PendingEvent { position, ingest: None };
-            match winners.entry(u64::from(row.fingerprint)) {
-                Entry::Vacant(entry) => {
-                    entry.insert(pending);
-                }
-                Entry::Occupied(mut entry) => {
-                    let id = event_id_at(position, chunks);
-                    let previous = entry.get_mut();
-                    if id == event_id_at(previous.position, chunks) {
-                        keep_earliest(previous, position, chunks, calendar, skipped);
-                    } else {
-                        // Equal fingerprints can represent distinct IDs. The first
-                        // ID stays in the fingerprint map and the others use exact
-                        // spellings, so they each select their own winner.
-                        match collisions.entry(id) {
-                            Entry::Vacant(entry) => { entry.insert(pending); }
-                            Entry::Occupied(mut entry) => {
-                                keep_earliest(entry.get_mut(), position, chunks, calendar, skipped);
-                            }
-                        }
-                    }
-                }
-            }
+impl PendingEvent {
+    fn reject(self, losers: &mut Vec<(u32, u32)>) {
+        if self.location != group::NO_LOCATION {
+            losers.push((self.batch, self.location));
         }
     }
 }
 
-fn keep_earliest(
-    previous: &mut PendingEvent, position: Position, chunks: &[&[u8]],
-    calendar: &IngestCalendar, skipped: &mut Vec<Position>,
-) {
-    // Only confirmed duplicate IDs need a second look at the CSV and ingest.
-    // Leave time, type and purchase validation for the chosen winner.
-    let Some(ingest) = ingest_at(position, chunks, calendar) else {
-        skipped.push(position);
-        return;
-    };
-    let old_ingest = previous.ingest.or_else(|| ingest_at(previous.position, chunks, calendar));
-    if old_ingest.is_none_or(|old| ingest < old) {
-        skipped.push(previous.position);
-        *previous = PendingEvent { position, ingest: Some(ingest) };
-    } else {
-        skipped.push(position);
-        previous.ingest = old_ingest;
-    }
+#[inline]
+fn repeat_slot(hash: u64, mask: usize) -> (usize, u64) {
+    let slot = hash as usize & mask;
+    (slot >> 5, 1 << ((slot & 31) * 2))
 }
 
-fn prepare_event<'a, E: EventRecord>(
-    line: &'a [u8], catalog: &Catalog<'a>, window: Window, calendar: &IngestCalendar,
-) -> Option<EventRow<'a, E>> {
-    let [id, user, at, ingest, kind, product, price] = fields(line)?;
-    if id.is_empty() { return None; }
-    let ingest = calendar.parse(ingest)?;
-    prepare_event_row(user, at, ingest, kind, product, price, catalog, window)
+fn mark_fused_losers<K: Eq + Hash>(
+    parts: Vec<(u32, Vec<(K, Candidate)>)>, wide_ingests: &[Vec<i64>],
+    fingerprint: impl Fn(&K) -> u64, losers: &mut Vec<(u32, u32)>,
+) {
+    let count = parts.iter().map(|(_, candidates)| candidates.len()).sum::<usize>();
+    if count < 2 { return; }
+    let slots = count.saturating_mul(12).next_power_of_two().max(32);
+    let mut counts = vec![0u64; slots / 32];
+    for (key, _) in parts.iter().flat_map(|(_, candidates)| candidates) {
+        let (word, seen) = repeat_slot(fingerprint(key), slots - 1);
+        let bits = &mut counts[word];
+        *bits |= seen | ((*bits & seen) << 1);
+    }
+    let mut winners = Map::<K, PendingEvent>::with_capacity_and_hasher(count / 6, Default::default());
+    for (batch, candidates) in parts {
+        let wide = &wide_ingests[batch as usize];
+        for (key, candidate) in candidates {
+            let (word, seen) = repeat_slot(fingerprint(&key), slots - 1);
+            if counts[word] & (seen << 1) == 0 { continue; }
+            let pending = PendingEvent { batch, location: candidate.location, ingest: candidate.ingest(wide) };
+            match winners.entry(key) {
+                Entry::Vacant(entry) => { entry.insert(pending); }
+                Entry::Occupied(mut entry) if pending.ingest < entry.get().ingest => {
+                    entry.insert(pending).reject(losers);
+                }
+                Entry::Occupied(_) => pending.reject(losers),
+            }
+        }
+    }
 }
 
 fn prepare_event_row<'a, E: EventRecord>(
@@ -405,26 +322,48 @@ fn prepare_event_row<'a, E: EventRecord>(
 }
 
 fn load_events<'a, E: EventRecord>(
-    table: &'a Table, catalog: &Catalog<'a>,
-    window: Window, threads: usize,
+    table: &'a Table, catalog: &Catalog<'a>, window: Window, threads: usize,
 ) -> Vec<group::Batch<'a, E>> {
     let stage = Instant::now();
     let calendar = IngestCalendar::new(window.start, window.end);
-    let plan = EventPlan::build(table, &calendar, threads);
-    eprintln!("event winner plan      {:.3}s", stage.elapsed().as_secs_f64());
-    let stage = Instant::now();
-    let workers = worker_map(threads, plan.chunks.len(), group::Rows::new, |worker, index| {
-        let mut skipped = plan.skipped[index].iter().copied().peekable();
-        for (offset, line) in physical_rows(plan.chunks[index]) {
-            if skipped.peek() == Some(&offset) {
-                skipped.next();
-            } else if let Some(row) = prepare_event(line, catalog, window, &calendar) {
-                worker.push(row.user, row.event);
-            }
+    let chunks = table.data_chunks();
+    let workers = worker_map(threads, chunks.len(), || vec![FusedEventBatch::<E>::new()], |batches, index| {
+        if !batches.last().unwrap().accepts_chunk() {
+            batches.push(FusedEventBatch::new());
         }
+        batches.last_mut().unwrap().scan(chunks[index], catalog, window, &calendar);
     });
-    eprintln!("parse/partition events {:.3}s", stage.elapsed().as_secs_f64());
-    group::batch(workers)
+    eprintln!("fused event scan       {:.3}s", stage.elapsed().as_secs_f64());
+    let stage = Instant::now();
+    let mut wide = Vec::new();
+    let mut output = Vec::new();
+    let mut jobs: Vec<_> = (0..SHARDS).map(|_| Mutex::new((Vec::new(), Vec::new()))).collect();
+    for FusedEventBatch { packed, full, wide_ingests, output: rows, .. } in workers.into_iter().flatten() {
+        let batch = u32::try_from(wide.len()).expect("too many event batches");
+        wide.push(wide_ingests);
+        output.push((rows, Vec::new()));
+        for ((job, packed), full) in jobs.iter_mut().zip(packed).zip(full) {
+            let (packed_parts, full_parts) = job.get_mut().unwrap();
+            if !packed.is_empty() { packed_parts.push((batch, packed)); }
+            if !full.is_empty() { full_parts.push((batch, full)); }
+        }
+    }
+    let losers = worker_map(threads, jobs.len(), Vec::new, |worker, index| {
+        let (packed, full) = std::mem::take(&mut *jobs[index].lock().unwrap());
+        mark_fused_losers(packed, &wide, |hash| *hash, worker);
+        mark_fused_losers(full, &wide, |key| key.hash, worker);
+    });
+    for (batch, location) in losers.into_iter().flatten() {
+        output[batch as usize].1.push(location);
+    }
+    let output: Vec<_> = output.into_iter().map(|batch| Mutex::new(Some(batch))).collect();
+    let workers = worker_map(threads, output.len(), Vec::new, |worker, index| {
+        let (mut rows, locations) = output[index].lock().unwrap().take().unwrap();
+        rows.remove_located(locations);
+        worker.push(rows);
+    });
+    eprintln!("event winner removal   {:.3}s", stage.elapsed().as_secs_f64());
+    group::batch(workers.into_iter().flatten().collect())
 }
 
 fn prepare_click<'a, C: ClickRecord<'a>>(

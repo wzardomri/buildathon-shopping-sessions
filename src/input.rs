@@ -82,12 +82,6 @@ fn unquote(cell: &[u8]) -> Option<&[u8]> {
 }
 
 #[inline]
-pub fn first_field(line: &[u8]) -> Option<&[u8]> {
-    let comma = find(line, b',')?;
-    unquote(&line[..comma]).filter(|id| !id.is_empty())
-}
-
-#[inline]
 pub fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     #[cfg(target_arch = "x86_64")]
     if (16..=128).contains(&line.len()) {

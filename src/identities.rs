@@ -1,6 +1,6 @@
 use crate::input::{Map, SHARDS, Table, fields, hash_bytes, mix, shard, worker_map};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 #[inline]
 fn spread(key: u64) -> u64 {
@@ -51,14 +51,14 @@ impl<'a> Name<'a> {
         }
     }
 
-    fn lexical_min(self, other: Self) -> Self {
-        let left_is_first = match (self, other) {
-            (Self::Packed(left), Self::Packed(right)) => packed_order(left) <= packed_order(right),
-            (Self::Full(left), Self::Full(right)) => left <= right,
-            (Self::Packed(left), Self::Full(right)) => unpack(left, &mut [0; 9]) <= right,
-            (Self::Full(left), Self::Packed(right)) => left <= unpack(right, &mut [0; 9]),
-        };
-        if left_is_first { self } else { other }
+    #[inline]
+    fn precedes(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Packed(left), Self::Packed(right)) => packed_order(left) < packed_order(right),
+            (Self::Full(left), Self::Full(right)) => left < right,
+            (Self::Packed(left), Self::Full(right)) => unpack(left, &mut [0; 9]) < right,
+            (Self::Full(left), Self::Packed(right)) => left < unpack(right, &mut [0; 9]),
+        }
     }
 }
 
@@ -158,36 +158,88 @@ fn index_shard<'a>(
     BuiltShard { bucket, index, names }
 }
 
-struct Components<'a> {
-    parents: Vec<u32>,
-    sizes: Vec<u32>,
-    names: Vec<Name<'a>>,
+struct Parents {
+    slots: Vec<AtomicU32>,
 }
 
-impl Components<'_> {
-    #[inline]
-    fn root(&mut self, mut id: u32) -> u32 {
-        while self.parents[id as usize] != id {
-            let parent = self.parents[id as usize];
-            let grandparent = self.parents[parent as usize];
-            self.parents[id as usize] = grandparent;
-            id = grandparent;
-        }
-        id
+impl Parents {
+    fn new(count: usize) -> Self {
+        let count = u32::try_from(count).expect("too many distinct link endpoints");
+        Self { slots: (0..count).map(AtomicU32::new).collect() }
     }
 
     #[inline]
-    fn join(&mut self, left: u32, right: u32) {
-        let (mut left, mut right) = (self.root(left) as usize, self.root(right) as usize);
-        if left == right {
-            return;
+    fn parent(&self, vertex: u32) -> u32 {
+        self.slots[vertex as usize].load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn root(&self, mut vertex: u32) -> u32 {
+        loop {
+            let parent = self.parent(vertex);
+            if parent == vertex {
+                return vertex;
+            }
+            let grandparent = self.parent(parent);
+            if grandparent == parent {
+                return parent;
+            }
+            // A concurrent link or shortening may have updated the slot.
+            // Either path still leads to the same connected component.
+            let _ = self.slots[vertex as usize].compare_exchange_weak(
+                parent, grandparent, Ordering::Relaxed, Ordering::Relaxed,
+            );
+            vertex = grandparent;
         }
-        if self.sizes[left] < self.sizes[right] {
-            std::mem::swap(&mut left, &mut right);
+    }
+
+    #[inline]
+    fn join(&self, mut left: u32, mut right: u32) {
+        loop {
+            left = self.root(left);
+            right = self.root(right);
+            if left == right {
+                return;
+            }
+            let high = left.max(right);
+            let low = left.min(right);
+            // Parent links always point toward lower indices. Attaching a
+            // still-current high root to low cannot introduce a cycle, even
+            // if another edge has already attached low to a lower root.
+            if self.slots[high as usize].compare_exchange(
+                high, low, Ordering::Relaxed, Ordering::Relaxed,
+            ).is_ok() {
+                return;
+            }
         }
-        self.parents[right] = left as u32;
-        self.sizes[left] += self.sizes[right];
-        self.names[left] = self.names[left].lexical_min(self.names[right]);
+    }
+
+    fn name_roots(&self, names: &[Name<'_>], threads: usize) -> Vec<AtomicU32> {
+        const BLOCK: usize = 4096;
+        let minima: Vec<_> = (0..self.slots.len() as u32).map(AtomicU32::new).collect();
+        // All unions have finished before this pass. Shortening parents to
+        // their final root preserves connectivity and leaves root slots fixed.
+        worker_map(threads, names.len().div_ceil(BLOCK), || (), |_, job| {
+            let first = job * BLOCK;
+            for vertex in first..(first + BLOCK).min(names.len()) {
+                let root = self.root(vertex as u32) as usize;
+                if root == vertex {
+                    continue;
+                }
+                self.slots[vertex].store(root as u32, Ordering::Relaxed);
+                let best = &minima[root];
+                let mut incumbent = best.load(Ordering::Relaxed);
+                while names[vertex].precedes(names[incumbent as usize]) {
+                    match best.compare_exchange_weak(
+                        incumbent, vertex as u32, Ordering::Relaxed, Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(updated) => incumbent = updated,
+                    }
+                }
+            }
+        });
+        minima
     }
 }
 
@@ -198,21 +250,21 @@ struct DirectShard<'a> {
 }
 
 impl<'a> DirectShard<'a> {
-    fn from_index(base: u32, index: Index<'a>, names: &[Name<'a>]) -> Self {
+    fn from_index(base: u32, index: Index<'a>, owner: impl Fn(u32) -> Name<'a>) -> Self {
         // Canonical spellings and singletons need no entry. Start with a
         // smaller allocation and let unusual link shapes grow it as needed.
         let mut packed = Map::with_capacity_and_hasher(index.short.len() / 2, Default::default());
         let mut packed_full = Map::default();
         let mut full = Map::default();
         for (key, node) in index.short {
-            match names[(base + node) as usize] {
+            match owner(base + node) {
                 Name::Packed(owner) if owner == key => {}
                 Name::Packed(owner) => { packed.insert(key, owner); }
                 Name::Full(owner) => { packed_full.insert(key, owner); }
             }
         }
         for (key, node) in index.other {
-            match names[(base + node) as usize] {
+            match owner(base + node) {
                 Name::Full(owner) if owner == key => {}
                 owner => { full.insert(key, owner); }
             }
@@ -267,31 +319,30 @@ impl<'a> Identities<'a> {
             indices.push((names.len() as u32, part.index));
             names.extend(part.names);
         }
-        let mut groups = Components {
-            parents: (0..names.len() as u32).collect(),
-            sizes: vec![1; names.len()],
-            names,
-        };
+        let parents = Parents::new(names.len());
         let global_id = |code: u64| indices[(code >> 32) as usize].0 + code as u32;
-        for edge in assigned.chunks_exact(2) {
-            groups.join(
-                global_id(edge[0].load(Ordering::Relaxed)),
-                global_id(edge[1].load(Ordering::Relaxed)),
-            );
-        }
-        // Roots already hold the component's canonical spelling. Writing
-        // that spelling into a non-root slot does not change any root.
-        for id in 0..groups.parents.len() {
-            let root = groups.root(id as u32) as usize;
-            groups.names[id] = groups.names[root];
-        }
-        let Components { parents, sizes, names } = groups;
-        drop((assigned, parents, sizes));
+        const ENDPOINT_BLOCK: usize = 8192;
+        worker_map(threads, assigned.len().div_ceil(ENDPOINT_BLOCK), || (), |_, job| {
+            let first = job * ENDPOINT_BLOCK;
+            let end = (first + ENDPOINT_BLOCK).min(assigned.len());
+            for edge in assigned[first..end].chunks_exact(2) {
+                parents.join(
+                    global_id(edge[0].load(Ordering::Relaxed)),
+                    global_id(edge[1].load(Ordering::Relaxed)),
+                );
+            }
+        });
+        drop(assigned);
+        let minima = parents.name_roots(&names, threads);
+        let canonical = |vertex| {
+            let root = parents.parent(vertex);
+            names[minima[root as usize].load(Ordering::Relaxed) as usize]
+        };
 
         let sources: Vec<_> = indices.into_iter().map(|item| Mutex::new(Some(item))).collect();
         let mut shards: Vec<_> = worker_map(threads, sources.len(), Vec::new, |worker, bucket| {
             let (base, index) = sources[bucket].lock().unwrap().take().unwrap();
-            worker.push((bucket, DirectShard::from_index(base, index, &names)));
+            worker.push((bucket, DirectShard::from_index(base, index, canonical)));
         }).into_iter().flatten().collect();
         shards.sort_unstable_by_key(|(bucket, _)| *bucket);
 
@@ -327,7 +378,7 @@ impl<'a> Identities<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DirectShard, Index, Name, packed, unpack};
+    use super::{DirectShard, Index, Name, Ordering, Parents, packed, worker_map};
 
     #[test]
     fn canonical_name_order_matches_bytes() {
@@ -350,12 +401,74 @@ mod tests {
         ];
         for &left in names {
             for &right in names {
-                let mut buffer = [0; 9];
-                let actual = match Name::from_bytes(left).lexical_min(Name::from_bytes(right)) {
-                    Name::Packed(key) => unpack(key, &mut buffer),
-                    Name::Full(bytes) => bytes,
-                };
-                assert_eq!(actual, left.min(right));
+                assert_eq!(Name::from_bytes(left).precedes(Name::from_bytes(right)), left < right);
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_components_agree_with_graph_traversal() {
+        const COUNT: usize = 8192;
+        let bytes: Vec<_> = (0..COUNT).map(|vertex| match vertex % 5 {
+            0 => format!("u{vertex:08x}"),
+            1 => format!("U{vertex:08x}"),
+            2 => format!(" alias {vertex:08x}"),
+            3 => format!("u{vertex:06x}\0"),
+            _ => format!("é {vertex:08x}"),
+        }).collect();
+        let names: Vec<_> = bytes.iter().map(|name| Name::from_bytes(name.as_bytes())).collect();
+        let connected = COUNT - 16;
+        let mut edges: Vec<_> = (31..connected).rev().map(|vertex| (vertex, vertex - 31)).collect();
+        let mut seed = 91u32;
+        for _ in 0..28_000 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let vertex = seed as usize % connected;
+            edges.push((vertex % 31, vertex));
+        }
+        edges.extend([(COUNT - 1, COUNT - 1), (10, 10), (2, 7), (7, 2)]);
+        let mut neighbors = vec![Vec::new(); COUNT];
+        for &(left, right) in &edges {
+            neighbors[left].push(right);
+            neighbors[right].push(left);
+        }
+
+        let mut visited = vec![false; COUNT];
+        let mut expected = vec![0; COUNT];
+        for first in 0..COUNT {
+            if visited[first] {
+                continue;
+            }
+            let mut members = vec![first];
+            visited[first] = true;
+            let mut cursor = 0;
+            while let Some(&vertex) = members.get(cursor) {
+                for &neighbor in &neighbors[vertex] {
+                    if !visited[neighbor] {
+                        visited[neighbor] = true;
+                        members.push(neighbor);
+                    }
+                }
+                cursor += 1;
+            }
+            let owner = *members.iter().min_by_key(|&&vertex| &bytes[vertex]).unwrap();
+            for vertex in members {
+                expected[vertex] = owner;
+            }
+        }
+
+        for threads in [1, 2, 8] {
+            let parents = Parents::new(COUNT);
+            worker_map(threads, edges.len().div_ceil(1024), || (), |_, block| {
+                let start = block * 1024;
+                for &(left, right) in &edges[start..(start + 1024).min(edges.len())] {
+                    parents.join(left as u32, right as u32);
+                }
+            });
+            let minima = parents.name_roots(&names, threads);
+            for (vertex, &owner) in expected.iter().enumerate() {
+                let root = parents.parent(vertex as u32);
+                assert_eq!(parents.parent(root), root);
+                assert_eq!(minima[root as usize].load(Ordering::Relaxed) as usize, owner);
             }
         }
     }
@@ -381,7 +494,7 @@ mod tests {
             Name::Packed(unchanged),
             Name::Full(b"A long canonical spelling"),
         ];
-        let aliases = DirectShard::from_index(1, index, &names);
+        let aliases = DirectShard::from_index(1, index, |vertex| names[vertex as usize]);
         assert_eq!(aliases.packed.len(), 1);
         assert_eq!(aliases.packed.get(&renamed), Some(&unchanged));
         assert_eq!(aliases.packed_full.len(), 1);

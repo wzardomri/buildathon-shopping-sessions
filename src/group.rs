@@ -2,6 +2,12 @@ use crate::identities::Name;
 use crate::input::{Map, SHARDS, transpose};
 use std::hash::Hash;
 
+const FULL_LOCATION: u32 = 1 << 31;
+const LOCATION_BITS: u32 = 31 - SHARDS.trailing_zeros();
+const LOCATION_MASK: u32 = (1 << LOCATION_BITS) - 1;
+pub const MAX_LOCATED_ROWS: usize = LOCATION_MASK as usize;
+pub const NO_LOCATION: u32 = u32::MAX;
+
 pub struct Rows<'a, T> {
     packed: Vec<Vec<(u64, T)>>,
     full: Vec<Vec<(&'a [u8], T)>>,
@@ -20,6 +26,44 @@ impl<'a, T> Rows<'a, T> {
         match name {
             Name::Packed(key) => self.packed[shard].push((key, row)),
             Name::Full(key) => self.full[shard].push((key, row)),
+        }
+    }
+
+    pub fn push_located(&mut self, name: Name<'a>, row: T) -> u32 {
+        let shard = name.shard();
+        let location = (shard as u32) << LOCATION_BITS;
+        // The event scanner limits each batch to MAX_LOCATED_ROWS, ensuring
+        // no single shard runs out of representable slots.
+        match name {
+            Name::Packed(key) => {
+                let rows = &mut self.packed[shard];
+                let slot = rows.len();
+                debug_assert!(slot < MAX_LOCATED_ROWS);
+                rows.push((key, row));
+                location | slot as u32
+            }
+            Name::Full(key) => {
+                let rows = &mut self.full[shard];
+                let slot = rows.len();
+                debug_assert!(slot < MAX_LOCATED_ROWS);
+                rows.push((key, row));
+                FULL_LOCATION | location | slot as u32
+            }
+        }
+    }
+
+    pub fn remove_located(&mut self, mut locations: Vec<u32>) {
+        // Sorting descending puts each shard's tail losers first. Moving a
+        // survivor into a removed slot leaves the remaining indices intact.
+        locations.sort_unstable_by(|left, right| right.cmp(left));
+        for location in locations {
+            let shard = ((location & !FULL_LOCATION) >> LOCATION_BITS) as usize;
+            let slot = (location & LOCATION_MASK) as usize;
+            if location & FULL_LOCATION == 0 {
+                self.packed[shard].swap_remove(slot);
+            } else {
+                self.full[shard].swap_remove(slot);
+            }
         }
     }
 }
