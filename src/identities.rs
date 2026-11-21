@@ -44,10 +44,6 @@ impl<'a> Name<'a> {
         packed(bytes).map_or(Self::Full(bytes), Self::Packed)
     }
 
-    pub fn is_empty(self) -> bool {
-        matches!(self, Self::Full(b""))
-    }
-
     fn lexical_min(self, other: Self) -> Self {
         let left_is_first = match (self, other) {
             (Self::Packed(left), Self::Packed(right)) => packed_order(left) <= packed_order(right),

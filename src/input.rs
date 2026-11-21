@@ -304,6 +304,12 @@ impl Table {
         self.files.iter().flat_map(|mapping| mapping.bytes().split(|&byte| byte == b'\n').skip(1))
     }
 
+    pub fn data_chunks(&self) -> Vec<&[u8]> {
+        self.chunks().into_iter().map(|chunk| {
+            &self.files[chunk.file].bytes()[chunk.start..chunk.end]
+        }).collect()
+    }
+
     pub fn scan<'a, T: Send>(
         &'a self, threads: usize, create: impl Fn() -> T + Sync,
         parse: impl Fn(&mut T, &'a [u8]) + Sync,

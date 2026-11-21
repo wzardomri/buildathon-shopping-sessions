@@ -4,7 +4,7 @@ mod input;
 mod output;
 
 use identities::{Identities, Name, unpack};
-use input::{DAY, IngestCalendar, Map, SHARDS, Table, WEEK, fields, first_field, hash_bytes, mix, shard, timestamp, transpose, unsigned, worker_map};
+use input::{DAY, IngestCalendar, Map, SHARDS, Table, WEEK, fields, find, first_field, hash_bytes, mix, shard, timestamp, transpose, unsigned, worker_map};
 use std::collections::hash_map::Entry;
 use std::env;
 use std::fs;
@@ -150,8 +150,6 @@ impl Hash for Key<'_> {
     fn hash<H: Hasher>(&self, hasher: &mut H) { hasher.write_u64(self.hash); }
 }
 
-struct EarlyCopy<'a, E> { ingest: i64, row: EventRow<'a, E> }
-
 // A table-specific prefix followed by at most eight bytes fits losslessly into
 // u64. Trailing NUL values use the fallback since zero is the padding byte.
 #[inline]
@@ -269,17 +267,141 @@ impl DuplicateFilter {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Position {
+    chunk: u32,
+    offset: u32,
+}
+
+struct EventPlan<'a> {
+    chunks: Vec<&'a [u8]>,
+    skipped: Vec<Vec<u32>>,
+}
+
+fn physical_rows(bytes: &[u8]) -> impl Iterator<Item = (u32, &[u8])> {
+    let mut offset = 0;
+    std::iter::from_fn(move || {
+        if offset >= bytes.len() {
+            return None;
+        }
+        let start = offset;
+        let remainder = &bytes[start..];
+        let len = find(remainder, b'\n').unwrap_or(remainder.len());
+        offset = start + len + 1;
+        // Chunking extends the 4 MiB target only through the final row.
+        // Even a long final row therefore starts within the compact range.
+        Some((u32::try_from(start).expect("invalid row offset"), &remainder[..len]))
+    })
+}
+
+impl<'a> EventPlan<'a> {
+    fn build(table: &'a Table, calendar: &IngestCalendar, threads: usize) -> Self {
+        let chunks = table.data_chunks();
+        let workers = worker_map(threads, chunks.len(), Partitions::new, |worker, index| {
+            let chunk = u32::try_from(index).expect("too many event file segments");
+            for (offset, line) in physical_rows(chunks[index]) {
+                if let Some(id) = first_field(line) {
+                    let key = ExactKey::new(id, b'e');
+                    let bucket = shard(key.fingerprint());
+                    worker.push(key, bucket, Position { chunk, offset });
+                }
+            }
+        });
+        let parts = dedup_jobs(workers);
+        let skipped = worker_map(threads, parts.len(), Vec::new, |worker, index| {
+            let (packed, fallback) = std::mem::take(&mut *parts[index].lock().unwrap());
+            mark_losers(packed, |key| {
+                let hash = mix(0, key);
+                (hash ^ (hash >> 33)) as u32
+            }, &chunks, calendar, worker);
+            mark_losers(fallback, |key| (key.hash ^ (key.hash >> 33)) as u32, &chunks, calendar, worker);
+        });
+        let mut by_chunk: Vec<Vec<_>> = (0..chunks.len()).map(|_| Vec::new()).collect();
+        for position in skipped.into_iter().flatten() {
+            by_chunk[position.chunk as usize].push(position.offset);
+        }
+        for offsets in &mut by_chunk {
+            offsets.sort_unstable();
+        }
+        Self { chunks, skipped: by_chunk }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PendingEvent {
+    position: Position,
+    // A singleton or a hash collision does not need a structure/ingest parse.
+    ingest: Option<i64>,
+}
+
+fn ingest_at(position: Position, chunks: &[&[u8]], calendar: &IngestCalendar) -> Option<i64> {
+    let line = &chunks[position.chunk as usize][position.offset as usize..];
+    let end = find(line, b'\n').unwrap_or(line.len());
+    let [_, _, _, ingest, _, _, _] = fields(&line[..end])?;
+    calendar.parse(ingest)
+}
+
+fn mark_losers<K: Copy + Eq + Hash>(
+    parts: Vec<Vec<(K, Position)>>,
+    fingerprint: impl Fn(K) -> u32,
+    chunks: &[&[u8]],
+    calendar: &IngestCalendar,
+    skipped: &mut Vec<Position>,
+) {
+    let count = parts.iter().map(Vec::len).sum::<usize>();
+    if count < 2 {
+        return;
+    }
+    let size = (count * 12).next_power_of_two().max(64);
+    let mut seen = vec![0u64; size / 64];
+    let mut repeated = vec![0u64; size / 64];
+    let slot = |key| (fingerprint(key) as usize) & (size - 1);
+    for (key, _) in parts.iter().flatten() {
+        let bit = slot(*key);
+        let word = bit >> 6;
+        let mask = 1u64 << (bit & 63);
+        repeated[word] |= seen[word] & mask;
+        seen[word] |= mask;
+    }
+    let mut winners = Map::with_capacity_and_hasher(count / 6, Default::default());
+    for (key, position) in parts.into_iter().flatten() {
+        let bit = slot(key);
+        if repeated[bit >> 6] & (1 << (bit & 63)) == 0 {
+            continue;
+        }
+        match winners.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(PendingEvent { position, ingest: None });
+            }
+            Entry::Occupied(mut entry) => {
+                // Only confirmed duplicate IDs need a second look at the CSV
+                // and ingest value. Do not validate time, type, or purchase
+                // fields here: an invalid earliest winner is a tombstone.
+                let Some(ingest) = ingest_at(position, chunks, calendar) else {
+                    skipped.push(position);
+                    continue;
+                };
+                let previous = entry.get_mut();
+                let old_ingest = previous.ingest.or_else(|| ingest_at(previous.position, chunks, calendar));
+                if old_ingest.is_none_or(|old| ingest < old) {
+                    skipped.push(previous.position);
+                    *previous = PendingEvent { position, ingest: Some(ingest) };
+                } else {
+                    skipped.push(position);
+                    previous.ingest = old_ingest;
+                }
+            }
+        }
+    }
+}
+
 fn prepare_event<'a, E: EventRecord>(
     line: &'a [u8], identities: &Identities<'a>, catalog: &Catalog<'a>, window: Window, calendar: &IngestCalendar,
-) -> Option<(&'a [u8], EarlyCopy<'a, E>)> {
+) -> Option<EventRow<'a, E>> {
     let [id, user, at, ingest, kind, product, price] = fields(line)?;
     if id.is_empty() { return None; }
     let ingest = calendar.parse(ingest)?;
-    // Invalid copies remain in the dedup stage as tombstones. In particular,
-    // a valid later copy must never rescue an invalid earliest copy.
-    let row = prepare_event_row(user, at, ingest, kind, product, price, identities, catalog, window)
-        .unwrap_or(EventRow { user: Name::Full(b""), event: E::default() });
-    Some((id, EarlyCopy { ingest, row }))
+    prepare_event_row(user, at, ingest, kind, product, price, identities, catalog, window)
 }
 
 fn prepare_event_row<'a, E: EventRecord>(
@@ -305,55 +427,22 @@ fn load_events<'a, E: EventRecord>(
     window: Window, threads: usize,
 ) -> Vec<group::Batch<'a, E>> {
     let stage = Instant::now();
-    let filter = DuplicateFilter::build(table, b'e', threads);
-    eprintln!("event duplicate filter {:.3}s", stage.elapsed().as_secs_f64());
-    let stage = Instant::now();
     let calendar = IngestCalendar::new(window.start, window.end);
-    let workers = table.scan(threads, Candidates::new, |worker, line| {
-        if let Some((id, candidate)) = prepare_event(line, identities, catalog, window, &calendar) {
-            let key = ExactKey::new(id, b'e');
-            let hash = key.fingerprint();
-            let bucket = shard(hash);
-            if filter.maybe_repeated(bucket, hash) {
-                worker.duplicates.push(key, bucket, candidate);
-            } else if !candidate.row.user.is_empty() {
-                let row = candidate.row;
-                worker.output.push(row.user, row.event);
+    let plan = EventPlan::build(table, &calendar, threads);
+    eprintln!("event winner plan      {:.3}s", stage.elapsed().as_secs_f64());
+    let stage = Instant::now();
+    let workers = worker_map(threads, plan.chunks.len(), group::Rows::new, |worker, index| {
+        let mut skipped = plan.skipped[index].iter().copied().peekable();
+        for (offset, line) in physical_rows(plan.chunks[index]) {
+            if skipped.peek() == Some(&offset) {
+                skipped.next();
+            } else if let Some(row) = prepare_event(line, identities, catalog, window, &calendar) {
+                worker.push(row.user, row.event);
             }
         }
     });
-    let (parts, mut output): (Vec<_>, Vec<_>) = workers.into_iter().map(|worker| (worker.duplicates, worker.output)).unzip();
-    let parts = dedup_jobs(parts);
     eprintln!("parse/partition events {:.3}s", stage.elapsed().as_secs_f64());
-    let stage = Instant::now();
-    let workers = worker_map(threads, parts.len(), group::Rows::new, |loaded, index| {
-        let (packed, fallback) = std::mem::take(&mut *parts[index].lock().unwrap());
-        select_events(packed, loaded);
-        select_events(fallback, loaded);
-    });
-    eprintln!("dedup/reroute events   {:.3}s", stage.elapsed().as_secs_f64());
-    output.extend(workers);
-    group::batch(output)
-}
-
-fn select_events<'a, K: Hash + Eq + Copy, E: Copy>(
-    parts: Vec<Vec<(K, EarlyCopy<'a, E>)>>, loaded: &mut group::Rows<'a, E>,
-) {
-    let count = parts.iter().map(Vec::len).sum::<usize>();
-    let mut winners = Map::with_capacity_and_hasher(count, Default::default());
-    for (key, candidate) in parts.iter().flatten() {
-        match winners.entry(*key) {
-            Entry::Vacant(entry) => { entry.insert(candidate); }
-            Entry::Occupied(mut entry) if candidate.ingest < entry.get().ingest => { entry.insert(candidate); }
-            Entry::Occupied(_) => {}
-        }
-    }
-    for winner in winners.into_values() {
-        let row = winner.row;
-        if !row.user.is_empty() {
-            loaded.push(row.user, row.event);
-        }
-    }
+    group::batch(workers)
 }
 
 fn prepare_click<'a>(
