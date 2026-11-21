@@ -486,6 +486,8 @@ pub struct IngestCalendar {
 }
 
 impl IngestCalendar {
+    pub const DEFER_CODE: u32 = u32::MAX;
+
     fn bucket(prefix: &[u8; 11]) -> usize {
         (usize::from(prefix[8]) * 10 + usize::from(prefix[9]) + (usize::from(prefix[6]) << 5)) & 63
     }
@@ -499,7 +501,7 @@ impl IngestCalendar {
                 let mut label = display_day(day);
                 label.push('T');
                 if let Ok(prefix) = <[u8; 11]>::try_from(label.as_bytes()) {
-                    days[Self::bucket(&prefix)] = (prefix, i64::from(day) * DAY);
+                    days[Self::bucket(&prefix)] = (prefix, i64::from(day) * (DAY / 1000));
                 }
             }
         }
@@ -507,11 +509,11 @@ impl IngestCalendar {
     }
 
     #[inline]
-    pub fn parse(&self, bytes: &[u8]) -> Option<i64> {
+    pub fn parse(&self, bytes: &[u8]) -> Option<(i64, u32)> {
         if let Ok(clock) = <&[u8; 20]>::try_from(bytes) {
             let prefix = <&[u8; 11]>::try_from(&clock[..11]).unwrap();
             let (expected, midnight) = &self.days[Self::bucket(prefix)];
-            if prefix == expected && clock[19] == b'Z' {
+            if prefix == expected && clock[10] == b'T' && clock[19] == b'Z' {
                 const DIGIT_HIGH: u64 = 0xf0f0_00f0_f000_f0f0;
                 const FIXED_BYTES: u64 = 0x0000_ff00_00ff_0000;
                 const FIXED_FORM: u64 = u64::from_le_bytes(*b"00:00:00");
@@ -530,10 +532,16 @@ impl IngestCalendar {
                     return None;
                 }
                 let seconds = hours * 3600 + m1 * 600 + m2 * 60 + s1 * 10 + s2;
-                return Some(midnight + seconds as i64 * 1000);
+                let seconds = midnight + seconds as i64;
+                let code = if seconds as u64 >= 1u64 << 31 {
+                    Self::DEFER_CODE
+                } else {
+                    seconds as u32
+                };
+                return Some((seconds * 1000, code));
             }
         }
-        timestamp(bytes)
+        timestamp(bytes).map(|millis| (millis, Self::DEFER_CODE))
     }
 }
 

@@ -6,7 +6,7 @@ mod output;
 
 use click::{Click, ClickRecord, PackedClick};
 use identities::{Identities, Name, unpack};
-use input::{CHUNK_BYTES, DAY, IngestCalendar, Map, SHARDS, Table, WEEK, fields, find, hash_bytes, mix, shard, timestamp, transpose, unsigned, worker_map};
+use input::{CHUNK_BYTES, DAY, IngestCalendar, Map, SHARDS, Table, WEEK, fields, find, hash_bytes, mix, timestamp, transpose, unsigned, worker_map};
 use std::collections::hash_map::Entry;
 use std::env;
 use std::fs;
@@ -203,11 +203,18 @@ struct FusedEventBatch<'a, E> {
     candidates: usize,
 }
 
+// Keep each winner job's working set smaller at full scale without
+// changing the partitioning used for raw or linked user IDs.
+const WINNER_SHARDS: usize = 256;
+
+#[inline]
+fn winner_shard(hash: u64) -> usize { ((hash >> 32) as usize) & (WINNER_SHARDS - 1) }
+
 impl<'a, E: EventRecord> FusedEventBatch<'a, E> {
     fn new() -> Self {
         Self {
-            packed: buckets(),
-            full: buckets(),
+            packed: (0..WINNER_SHARDS).map(|_| Vec::new()).collect(),
+            full: (0..WINNER_SHARDS).map(|_| Vec::new()).collect(),
             wide_ingests: Vec::new(),
             output: group::Rows::new(),
             candidates: 0,
@@ -229,22 +236,27 @@ impl<'a, E: EventRecord> FusedEventBatch<'a, E> {
             bytes = &bytes[(end + 1).min(bytes.len())..];
             let Some([id, user, at, ingest, kind, product, price]) = fields(line) else { continue };
             if id.is_empty() { continue; }
-            let Some(ingest) = calendar.parse(ingest) else { continue };
-            let location = match prepare_event_row::<E>(user, at, ingest, kind, product, price, catalog, window) {
+            let Some((ingest, direct_code)) = calendar.parse(ingest) else { continue };
+            let location = match prepare_event_row::<E>(user, at, ingest, kind, product, price, catalog, window, calendar) {
                 Some(row) => self.output.push_located(row.user, row.event),
                 None => group::NO_LOCATION,
             };
             // Rows without valid event payloads still participate in dedup;
             // the earliest copy can suppress valid rows with the same ID.
-            let candidate = Candidate { location, ingest_code: pack_ingest(ingest, &mut self.wide_ingests) };
+            let ingest_code = if direct_code == IngestCalendar::DEFER_CODE {
+                pack_ingest(ingest, &mut self.wide_ingests)
+            } else {
+                direct_code
+            };
+            let candidate = Candidate { location, ingest_code };
             if let Some(key) = packed_key(id, b'e') {
                 // Odd multiplication followed by xor-shift is reversible, so
                 // the full hash identifies a packed spelling without collision.
                 let hash = fold_hash(mix(0, key));
-                self.packed[shard(hash)].push((hash, candidate));
+                self.packed[winner_shard(hash)].push((hash, candidate));
             } else {
                 let key = Key::new(id);
-                self.full[shard(key.hash)].push((key, candidate));
+                self.full[winner_shard(key.hash)].push((key, candidate));
             }
             self.candidates += 1;
         }
@@ -303,14 +315,118 @@ fn mark_fused_losers<K: Eq + Hash>(
     }
 }
 
+const INDEX_LANES: usize = 8;
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+fn index_masks(entries: &[u32; INDEX_LANES], mask: u32, tag: u32) -> (u32, u32) {
+    use std::arch::x86_64::{
+        _mm256_and_si256, _mm256_castsi256_ps, _mm256_cmpeq_epi32,
+        _mm256_loadu_si256, _mm256_movemask_ps, _mm256_set1_epi32, _mm256_setzero_si256,
+    };
+    // The array contains eight u32 entries and therefore covers the whole
+    // unaligned AVX2 load, including at the final group of the index.
+    unsafe {
+        let values = _mm256_loadu_si256(entries.as_ptr().cast());
+        let free = _mm256_cmpeq_epi32(values, _mm256_setzero_si256());
+        let tags = _mm256_and_si256(values, _mm256_set1_epi32(mask as i32));
+        let matches = _mm256_cmpeq_epi32(tags, _mm256_set1_epi32(tag as i32));
+        let free = _mm256_movemask_ps(_mm256_castsi256_ps(free)) as u32;
+        let matches = _mm256_movemask_ps(_mm256_castsi256_ps(matches)) as u32;
+        (matches & !free, free)
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline]
+fn index_masks(entries: &[u32; INDEX_LANES], mask: u32, tag: u32) -> (u32, u32) {
+    let mut matches = 0;
+    let mut free = 0;
+    for (lane, &entry) in entries.iter().enumerate() {
+        if entry == 0 { free |= 1 << lane; }
+        else if entry & mask == tag { matches |= 1 << lane; }
+    }
+    (matches, free)
+}
+
+fn mark_packed_losers(
+    parts: Vec<(u32, Vec<(u64, Candidate)>)>, wide_ingests: &[Vec<i64>],
+    table: &mut Vec<u32>, losers: &mut Vec<(u32, u32)>,
+) {
+    let count = parts.iter().map(|(_, rows)| rows.len()).sum::<usize>();
+    if count < 2 { return; }
+    let longest = parts.iter().map(|(_, rows)| rows.len()).max().unwrap();
+    let part_width = longest.next_power_of_two();
+    let Some(reference_span) = parts.len().checked_mul(part_width).filter(|&span| span < 1 << 24) else {
+        // Keep at least eight tag bits. The exact general implementation
+        // also handles unusually large or uneven packed partitions.
+        mark_fused_losers(parts, wide_ingests, |hash| *hash, losers);
+        return;
+    };
+    let row_bits = part_width.trailing_zeros();
+    let row_mask = (part_width - 1) as u32;
+    let reference_bits = usize::BITS - reference_span.leading_zeros();
+    let reference_mask = (1u32 << reference_bits) - 1;
+    let capacity = (count + count / 2).next_power_of_two().max(INDEX_LANES);
+    let slot_mask = capacity - 1;
+    table.clear();
+    table.resize(capacity, 0);
+
+    for (part, (batch, rows)) in parts.iter().enumerate() {
+        let reference_base = (part as u32) << row_bits;
+        let wide = &wide_ingests[*batch as usize];
+        'candidate: for (index, &(key, candidate)) in rows.iter().enumerate() {
+            let fingerprint = fold_hash(mix(0, key));
+            let tag = (fingerprint >> 32) as u32 & !reference_mask;
+            let reference = reference_base + index as u32 + 1; // Zero marks an empty slot.
+            let mut group = fingerprint as usize & slot_mask & !(INDEX_LANES - 1);
+            loop {
+                let entries = table[group..group + INDEX_LANES].try_into().unwrap();
+                let (mut matches, free) = index_masks(entries, !reference_mask, tag);
+                while matches != 0 {
+                    let slot = group + matches.trailing_zeros() as usize;
+                    matches &= matches - 1;
+                    let stored = table[slot];
+                    let previous_ref = (stored & reference_mask) - 1;
+                    let (previous_batch, previous_rows) = &parts[(previous_ref >> row_bits) as usize];
+                    let (previous_key, previous) = previous_rows[(previous_ref & row_mask) as usize];
+                    if previous_key == key {
+                        // The complete packed key is injective. A tag match
+                        // alone can only justify reading that key.
+                        let previous_wide = &wide_ingests[*previous_batch as usize];
+                        let (loser_batch, loser) = if candidate.ingest(wide) < previous.ingest(previous_wide) {
+                            table[slot] = tag | reference;
+                            (*previous_batch, previous)
+                        } else {
+                            (*batch, candidate)
+                        };
+                        if loser.location != group::NO_LOCATION {
+                            losers.push((loser_batch, loser.location));
+                        }
+                        continue 'candidate;
+                    }
+                }
+                // Since slots are never deleted, an available slot means
+                // this key could not have been inserted in a later group.
+                if free != 0 {
+                    table[group + free.trailing_zeros() as usize] = tag | reference;
+                    break;
+                }
+                group = (group + INDEX_LANES) & slot_mask;
+            }
+        }
+    }
+}
+
 fn prepare_event_row<'a, E: EventRecord>(
     user: &'a [u8], at: &[u8], ingest: i64, kind: &[u8], product: &[u8], price: &[u8],
-    catalog: &Catalog<'a>, window: Window,
+    catalog: &Catalog<'a>, window: Window, calendar: &IngestCalendar,
 ) -> Option<EventRow<'a, E>> {
     if user.is_empty() || product.is_empty() || !matches!(kind, b"purchase" | b"cart" | b"view") {
         return None;
     }
-    let at = timestamp(at).filter(|&at| at >= window.start && at < window.end && ingest - at <= DAY)?;
+    let at = calendar.parse(at).map(|(at, _)| at)
+        .filter(|&at| at >= window.start && at < window.end && ingest - at <= DAY)?;
     let (price, category) = if kind == b"purchase" {
         let price = unsigned(price).filter(|&value| (1..=MAX_PRICE).contains(&value))?;
         let category = catalog.products.get(product).copied().unwrap_or(catalog.unknown);
@@ -337,7 +453,7 @@ fn load_events<'a, E: EventRecord>(
     let stage = Instant::now();
     let mut wide = Vec::new();
     let mut output = Vec::new();
-    let mut jobs: Vec<_> = (0..SHARDS).map(|_| Mutex::new((Vec::new(), Vec::new()))).collect();
+    let mut jobs: Vec<_> = (0..WINNER_SHARDS).map(|_| Mutex::new((Vec::new(), Vec::new()))).collect();
     for FusedEventBatch { packed, full, wide_ingests, output: rows, .. } in workers.into_iter().flatten() {
         let batch = u32::try_from(wide.len()).expect("too many event batches");
         wide.push(wide_ingests);
@@ -348,12 +464,12 @@ fn load_events<'a, E: EventRecord>(
             if !full.is_empty() { full_parts.push((batch, full)); }
         }
     }
-    let losers = worker_map(threads, jobs.len(), Vec::new, |worker, index| {
+    let losers = worker_map(threads, jobs.len(), || (Vec::new(), Vec::new()), |(losers, table), index| {
         let (packed, full) = std::mem::take(&mut *jobs[index].lock().unwrap());
-        mark_fused_losers(packed, &wide, |hash| *hash, worker);
-        mark_fused_losers(full, &wide, |key| key.hash, worker);
+        mark_packed_losers(packed, &wide, table, losers);
+        mark_fused_losers(full, &wide, |key| key.hash, losers);
     });
-    for (batch, location) in losers.into_iter().flatten() {
+    for (batch, location) in losers.into_iter().flat_map(|(losers, _)| losers) {
         output[batch as usize].1.push(location);
     }
     let output: Vec<_> = output.into_iter().map(|batch| Mutex::new(Some(batch))).collect();
