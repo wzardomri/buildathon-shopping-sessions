@@ -113,6 +113,36 @@ fn scalar_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
 
 #[cfg(target_arch = "x86_64")]
 fn scanned_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
+    let (mut commas, mut quotes) = delimiter_masks(line);
+    if commas.count_ones() as usize != N - 1 {
+        return None;
+    }
+    let mut values = [b"".as_slice(); N];
+    let mut start = 0;
+    for value in &mut values {
+        let stop = if commas == 0 { line.len() } else { commas.trailing_zeros() as usize };
+        let in_field = if stop == 128 { quotes } else { quotes & ((1u128 << stop) - 1) };
+        *value = if in_field == 0 {
+            &line[start..stop]
+        } else if stop - start >= 2 && in_field == (1u128 << start) | (1u128 << (stop - 1)) {
+            &line[start + 1..stop - 1]
+        } else {
+            return None;
+        };
+        quotes ^= in_field;
+        commas &= commas.wrapping_sub(1);
+        start = stop + 1;
+    }
+    Some(values)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn delimiter_masks(line: &[u8]) -> (u128, u128) {
+    #[cfg(target_feature = "avx2")]
+    if line.len() >= 32 {
+        return avx_delimiter_masks(line);
+    }
     use std::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8};
 
     let mut commas = 0u128;
@@ -140,26 +170,40 @@ fn scanned_fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
             quotes |= (quote >> (16 - remainder)) << full;
         }
     }
-    if commas.count_ones() as usize != N - 1 {
-        return None;
-    }
-    let mut values = [b"".as_slice(); N];
-    let mut start = 0;
-    for value in &mut values {
-        let stop = if commas == 0 { line.len() } else { commas.trailing_zeros() as usize };
-        let in_field = if stop == 128 { quotes } else { quotes & ((1u128 << stop) - 1) };
-        *value = if in_field == 0 {
-            &line[start..stop]
-        } else if stop - start >= 2 && in_field == (1u128 << start) | (1u128 << (stop - 1)) {
-            &line[start + 1..stop - 1]
-        } else {
-            return None;
+    (commas, quotes)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline]
+fn avx_delimiter_masks(line: &[u8]) -> (u128, u128) {
+    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8};
+
+    let mut commas = 0u128;
+    let mut quotes = 0u128;
+    let full = line.len() / 32 * 32;
+    let remainder = line.len() - full;
+    // The AVX2 path is compiled only for hosts where AVX2 is part of the
+    // declared target. Both full and overlapping tail loads stay in bounds.
+    unsafe {
+        let comma = _mm256_set1_epi8(b',' as i8);
+        let quote = _mm256_set1_epi8(b'"' as i8);
+        let masks = |at| {
+            let block = _mm256_loadu_si256(line.as_ptr().add(at).cast::<__m256i>());
+            (u128::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(block, comma)) as u32),
+             u128::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(block, quote)) as u32))
         };
-        quotes ^= in_field;
-        commas &= commas.wrapping_sub(1);
-        start = stop + 1;
+        for at in (0..full).step_by(32) {
+            let (comma, quote) = masks(at);
+            commas |= comma << at;
+            quotes |= quote << at;
+        }
+        if remainder != 0 {
+            let (comma, quote) = masks(line.len() - 32);
+            commas |= (comma >> (32 - remainder)) << full;
+            quotes |= (quote >> (32 - remainder)) << full;
+        }
     }
-    Some(values)
+    (commas, quotes)
 }
 
 #[derive(Clone, Copy)]

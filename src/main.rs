@@ -1,8 +1,9 @@
+mod group;
 mod identities;
 mod input;
 mod output;
 
-use identities::Identities;
+use identities::{Identities, Name, unpack};
 use input::{DAY, Map, SHARDS, Table, WEEK, fields, first_field, hash_bytes, mix, shard, timestamp, transpose, unsigned, worker_map};
 use std::collections::hash_map::Entry;
 use std::env;
@@ -68,7 +69,7 @@ impl<'a> Catalog<'a> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Event {
     at: i64,
     price: u32,
@@ -76,9 +77,9 @@ struct Event {
 }
 
 #[derive(Clone, Copy)]
-struct EventRow<'a> { user: &'a [u8], event: Event }
+struct EventRow<'a> { user: Name<'a>, event: Event }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Click<'a> {
     at: i64,
     id: &'a [u8],
@@ -86,7 +87,7 @@ struct Click<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct ClickRow<'a> { user: &'a [u8], click: Click<'a> }
+struct ClickRow<'a> { user: Name<'a>, click: Click<'a> }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Key<'a> { hash: u64, id: &'a [u8] }
@@ -163,11 +164,11 @@ fn dedup_jobs<K, V>(workers: Vec<Partitions<K, V>>) -> Vec<Mutex<(Vec<Vec<(u64, 
 
 struct Candidates<'a, V, R> {
     duplicates: Partitions<Key<'a>, V>,
-    output: Vec<Vec<R>>,
+    output: group::Rows<'a, R>,
 }
 
 impl<'a, V, R> Candidates<'a, V, R> {
-    fn new() -> Self { Self { duplicates: Partitions::new(), output: buckets() } }
+    fn new() -> Self { Self { duplicates: Partitions::new(), output: group::Rows::new() } }
 }
 
 fn buckets<T>() -> Vec<Vec<T>> { (0..SHARDS).map(|_| Vec::new()).collect() }
@@ -227,7 +228,7 @@ fn prepare_event<'a>(
     // Invalid copies remain in the dedup stage as tombstones. In particular,
     // a valid later copy must never rescue an invalid earliest copy.
     let row = prepare_event_row(user, at, ingest, kind, product, price, identities, catalog, window)
-        .unwrap_or(EventRow { user: b"", event: Event { at: 0, price: 0, category: 0 } });
+        .unwrap_or(EventRow { user: Name::Full(b""), event: Event::default() });
     Some((id, EarlyCopy { ingest, row }))
 }
 
@@ -252,7 +253,7 @@ fn prepare_event_row<'a>(
 fn load_events<'a>(
     table: &'a Table, identities: &Identities<'a>, catalog: &Catalog<'a>,
     window: Window, threads: usize,
-) -> Vec<Vec<Vec<EventRow<'a>>>> {
+) -> Vec<group::Batch<'a, Event>> {
     let stage = Instant::now();
     let filter = DuplicateFilter::build(table, b'e', threads);
     eprintln!("event duplicate filter {:.3}s", stage.elapsed().as_secs_f64());
@@ -266,7 +267,7 @@ fn load_events<'a>(
                 worker.duplicates.push(key, bucket, candidate);
             } else if !candidate.row.user.is_empty() {
                 let row = candidate.row;
-                worker.output[shard(hash_bytes(row.user))].push(row);
+                worker.output.push(row.user, row.event);
             }
         }
     });
@@ -274,17 +275,17 @@ fn load_events<'a>(
     let parts = dedup_jobs(parts);
     eprintln!("parse/partition events {:.3}s", stage.elapsed().as_secs_f64());
     let stage = Instant::now();
-    let workers = worker_map(threads, parts.len(), || (0..SHARDS).map(|_| Vec::new()).collect::<Vec<_>>(), |loaded, index| {
+    let workers = worker_map(threads, parts.len(), group::Rows::new, |loaded, index| {
         let (packed, fallback) = std::mem::take(&mut *parts[index].lock().unwrap());
         select_events(packed, loaded);
         select_events(fallback, loaded);
     });
     eprintln!("dedup/reroute events   {:.3}s", stage.elapsed().as_secs_f64());
     output.extend(workers);
-    transpose(output)
+    group::batch(output)
 }
 
-fn select_events<'a, K: Hash + Eq + Copy>(parts: Vec<Vec<(K, EarlyCopy<'a>)>>, loaded: &mut [Vec<EventRow<'a>>]) {
+fn select_events<'a, K: Hash + Eq + Copy>(parts: Vec<Vec<(K, EarlyCopy<'a>)>>, loaded: &mut group::Rows<'a, Event>) {
     let count = parts.iter().map(Vec::len).sum::<usize>();
     let mut winners = Map::with_capacity_and_hasher(count, Default::default());
     for (key, candidate) in parts.iter().flatten() {
@@ -297,7 +298,7 @@ fn select_events<'a, K: Hash + Eq + Copy>(parts: Vec<Vec<(K, EarlyCopy<'a>)>>, l
     for winner in winners.into_values() {
         let row = winner.row;
         if !row.user.is_empty() {
-            loaded[shard(hash_bytes(row.user))].push(row);
+            loaded.push(row.user, row.event);
         }
     }
 }
@@ -316,7 +317,7 @@ fn prepare_click<'a>(
 fn load_clicks<'a>(
     table: &'a Table, identities: &Identities<'a>, catalog: &Catalog<'a>,
     window: Window, threads: usize,
-) -> Vec<Vec<Vec<ClickRow<'a>>>> {
+) -> Vec<group::Batch<'a, Click<'a>>> {
     let filter = DuplicateFilter::build(table, b'k', threads);
     let workers = table.scan(threads, Candidates::new, |worker, line| {
         if let Some((id, row)) = prepare_click(line, identities, catalog, window) {
@@ -326,35 +327,32 @@ fn load_clicks<'a>(
             if filter.maybe_repeated(bucket, hash) {
                 worker.duplicates.push(key, bucket, row);
             } else {
-                worker.output[shard(hash_bytes(row.user))].push(row);
+                worker.output.push(row.user, row.click);
             }
         }
     });
     let (parts, mut output): (Vec<_>, Vec<_>) = workers.into_iter().map(|worker| (worker.duplicates, worker.output)).unzip();
     let parts = dedup_jobs(parts);
-    let workers = worker_map(threads, parts.len(), || (0..SHARDS).map(|_| Vec::new()).collect::<Vec<_>>(), |loaded, index| {
+    let workers = worker_map(threads, parts.len(), group::Rows::new, |loaded, index| {
         let (packed, fallback) = std::mem::take(&mut *parts[index].lock().unwrap());
         select_clicks(packed, loaded);
         select_clicks(fallback, loaded);
     });
     output.extend(workers);
-    transpose(output)
+    group::batch(output)
 }
 
-fn select_clicks<'a, K: Hash + Eq>(parts: Vec<Vec<(K, ClickRow<'a>)>>, loaded: &mut [Vec<ClickRow<'a>>]) {
+fn select_clicks<'a, K: Hash + Eq>(parts: Vec<Vec<(K, ClickRow<'a>)>>, loaded: &mut group::Rows<'a, Click<'a>>) {
     let count = parts.iter().map(Vec::len).sum::<usize>();
     let mut seen = Map::with_capacity_and_hasher(count, Default::default());
     // Duplicate click copies are identical. Filtering before this set is
     // equivalent to filtering the surviving copy.
     for (key, row) in parts.into_iter().flatten() {
         if seen.insert(key, ()).is_none() {
-            loaded[shard(hash_bytes(row.user))].push(row);
+            loaded.push(row.user, row.click);
         }
     }
 }
-
-#[derive(Default)]
-struct Person<'a> { events: Vec<Event>, clicks: Vec<Click<'a>> }
 
 #[derive(Clone, Copy, Default)]
 struct CampaignDay { sessions: u64, purchasing: u64, revenue: u64, assisted: u64 }
@@ -365,6 +363,53 @@ impl CampaignDay {
         self.purchasing += value.purchasing;
         self.revenue += value.revenue;
         self.assisted += value.assisted;
+    }
+
+    fn has_sessions(self) -> bool {
+        self.sessions != 0 || self.assisted != 0
+    }
+}
+
+enum CampaignTotals {
+    Dense { first_day: i32, days: usize, rows: Vec<CampaignDay> },
+    Sparse(Map<(u32, i32), CampaignDay>),
+}
+
+impl CampaignTotals {
+    fn new(window: Window, campaigns: usize) -> Self {
+        let first_day = day_of(window.start);
+        let last_day = day_of(window.end - 1);
+        let days = (last_day - first_day + 1) as usize;
+        match campaigns.checked_mul(days).filter(|&size| size <= 512 * 1024) {
+            Some(size) => Self::Dense { first_day, days, rows: vec![CampaignDay::default(); size] },
+            None => Self::Sparse(Map::default()),
+        }
+    }
+
+    fn for_day(&mut self, campaign: u32, day: i32) -> &mut CampaignDay {
+        match self {
+            Self::Dense { first_day, days, rows } => {
+                &mut rows[campaign as usize * *days + (day - *first_day) as usize]
+            }
+            Self::Sparse(rows) => rows.entry((campaign, day)).or_default(),
+        }
+    }
+
+    fn into_rows(self, mut consume: impl FnMut((u32, i32), CampaignDay)) {
+        match self {
+            Self::Dense { first_day, days, rows } => {
+                for (index, row) in rows.into_iter().enumerate().filter(|(_, row)| row.has_sessions()) {
+                    let campaign = (index / days) as u32;
+                    let day = first_day + (index % days) as i32;
+                    consume((campaign, day), row);
+                }
+            }
+            Self::Sparse(rows) => {
+                for (key, row) in rows {
+                    consume(key, row);
+                }
+            }
+        }
     }
 }
 
@@ -388,34 +433,43 @@ impl UserDay {
 }
 
 struct Work {
-    users: Vec<u8>,
-    totals: Map<(u32, i32), CampaignDay>,
+    users: output::Users,
+    totals: CampaignTotals,
     anchors: Vec<i64>,
     windows: Vec<Option<(i64, i64)>>,
     seen: Vec<usize>,
-    days: Map<i32, String>,
+    categories: Vec<(u32, u64)>,
 }
 
 impl Work {
-    fn new(campaigns: usize) -> Self {
-        Self { users: vec![], totals: Map::default(), anchors: vec![], windows: vec![None; campaigns], seen: vec![],
-            days: Map::default() }
+    fn new(window: Window, campaigns: usize) -> Self {
+        Self {
+            users: output::Users::new(),
+            totals: CampaignTotals::new(window, campaigns),
+            anchors: vec![],
+            windows: vec![None; campaigns],
+            seen: vec![],
+            categories: vec![],
+        }
     }
 
-    fn process(&mut self, name: &[u8], mut person: Person<'_>, catalog: &Catalog<'_>) {
-        person.events.sort_unstable_by_key(|event| event.at);
-        person.clicks.sort_unstable_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(b.id)));
+    fn process(&mut self, name: &[u8], events: &mut [Event], clicks: &mut [Click<'_>], catalog: &Catalog<'_>) {
+        events.sort_unstable_by_key(|event| event.at);
+        clicks.sort_unstable_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(b.id)));
         self.anchors.clear();
-        let mut day_totals = UserDay::default();
+        let mut day_totals = UserDay {
+            categories: std::mem::take(&mut self.categories),
+            ..UserDay::default()
+        };
         let mut cursor = 0;
         let mut best: Option<Click<'_>> = None;
         let mut start = 0;
-        let mut day = day_of(person.events[0].at);
-        while start < person.events.len() {
-            let at = person.events[start].at;
+        let mut day = day_of(events[0].at);
+        while start < events.len() {
+            let at = events[start].at;
             let session_day = day_of(at);
             if day != session_day {
-                self.write_user_day(name, day, &day_totals, catalog);
+                self.write_user_day(name, day, &day_totals);
                 day_totals.sessions = 0;
                 day_totals.events = 0;
                 day_totals.revenue = 0;
@@ -423,11 +477,11 @@ impl Work {
                 day = session_day;
             }
             let mut end = start + 1;
-            while end < person.events.len() && person.events[end].at - person.events[end - 1].at <= SESSION_GAP {
+            while end < events.len() && events[end].at - events[end - 1].at <= SESSION_GAP {
                 end += 1;
             }
             let mut revenue = 0;
-            for event in &person.events[start..end] {
+            for event in &events[start..end] {
                 if event.price != 0 {
                     let price = u64::from(event.price);
                     revenue += price;
@@ -437,32 +491,29 @@ impl Work {
             day_totals.sessions += 1;
             day_totals.events += (end - start) as u64;
             self.anchors.push(at);
-            while let Some(&click) = person.clicks.get(cursor).filter(|click| click.at <= at) {
+            while let Some(&click) = clicks.get(cursor).filter(|click| click.at <= at) {
                 if best.is_none_or(|before| click.at > before.at) {
                     best = Some(click);
                 }
                 cursor += 1;
             }
             let campaign = best.filter(|click| click.at >= at - WEEK).map_or(catalog.organic, |click| click.campaign);
-            let total = self.totals.entry((campaign, day)).or_default();
+            let total = self.totals.for_day(campaign, day);
             total.sessions += 1;
             total.purchasing += u64::from(revenue != 0);
             total.revenue += revenue;
             start = end;
         }
-        self.write_user_day(name, day, &day_totals, catalog);
-        self.assists(&person.clicks[..cursor]);
+        self.write_user_day(name, day, &day_totals);
+        self.categories = day_totals.categories;
+        self.categories.clear();
+        self.assists(&clicks[..cursor]);
     }
 
-    fn write_user_day(&mut self, name: &[u8], day: i32, totals: &UserDay, catalog: &Catalog<'_>) {
-        use std::io::Write;
+    fn write_user_day(&mut self, name: &[u8], day: i32, totals: &UserDay) {
         let top = totals.categories.iter().min_by_key(|&&(category, cents)| (std::cmp::Reverse(cents), category))
-            .map(|&(id, _)| catalog.categories[id as usize]);
-        let day = self.days.entry(day).or_insert_with(|| input::display_day(day));
-        output::quote(&mut self.users, name).unwrap();
-        write!(self.users, ",{day},{},{},{},", totals.sessions, totals.events, totals.revenue).unwrap();
-        if let Some(top) = top { output::quote(&mut self.users, top).unwrap(); }
-        self.users.push(b'\n');
+            .map(|&(id, _)| id);
+        self.users.push(name, day, totals.sessions, totals.events, totals.revenue, top);
     }
 
     fn assists(&mut self, clicks: &[Click<'_>]) {
@@ -491,7 +542,7 @@ impl Work {
 fn day_of(at: i64) -> i32 { at.div_euclid(DAY) as i32 }
 
 fn count_assists(
-    anchors: &[i64], totals: &mut Map<(u32, i32), CampaignDay>, campaign: u32, first: i64, last: i64,
+    anchors: &[i64], totals: &mut CampaignTotals, campaign: u32, first: i64, last: i64,
 ) {
     let mut start = anchors.partition_point(|&at| at < first);
     let end = start + anchors[start..].partition_point(|&at| at <= last);
@@ -499,7 +550,7 @@ fn count_assists(
         let day = day_of(anchors[start]);
         let day_end = (i64::from(day) + 1) * DAY;
         let matching = anchors[start..end].partition_point(|&at| at < day_end);
-        totals.entry((campaign, day)).or_default().assisted += matching as u64;
+        totals.for_day(campaign, day).assisted += matching as u64;
         start += matching;
     }
 }
@@ -520,28 +571,25 @@ fn solve(data: &Path, scratch: &Path, threads: usize) -> io::Result<()> {
     let clicks = load_clicks(&clicks, &identities, &catalog, window, threads);
     eprintln!("partition clicks       {:.3}s", stage.elapsed().as_secs_f64());
     let stage = Instant::now();
-    let counts: Vec<_> = events.iter().map(|parts| parts.iter().map(Vec::len).sum::<usize>()).collect();
-    let mut jobs: Vec<_> = (0..SHARDS).collect();
-    jobs.sort_unstable_by_key(|&index| std::cmp::Reverse(counts[index]));
-    let workers = worker_map(threads, jobs.len(), || Work::new(catalog.campaign_rows.len()), |work, job| {
-        let bucket = jobs[job];
-        let mut people = Map::<&[u8], Person<'_>>::default();
-        for row in events[bucket].iter().flatten() {
-            people.entry(row.user).or_default().events.push(row.event);
-        }
-        for row in clicks[bucket].iter().flatten() {
-            if let Some(person) = people.get_mut(row.user) {
-                person.clicks.push(row.click);
-            }
-        }
-        for (name, person) in people {
-            work.process(name, person, &catalog);
-        }
+    let mut jobs: Vec<_> = events.into_iter().zip(clicks).map(Mutex::new).collect();
+    jobs.sort_unstable_by_key(|job| {
+        let (events, clicks) = &*job.lock().unwrap();
+        std::cmp::Reverse(events.len() + clicks.len())
+    });
+    let workers = worker_map(threads, jobs.len(), || Work::new(window, catalog.campaign_rows.len()), |work, job| {
+        let (events, clicks) = std::mem::take(&mut *jobs[job].lock().unwrap());
+        let mut name = [0; 9];
+        group::people(events.packed, clicks.packed, |key, events, clicks| {
+            work.process(unpack(key, &mut name), events, clicks, &catalog);
+        });
+        group::people(events.full, clicks.full, |name, events, clicks| {
+            work.process(name, events, clicks, &catalog);
+        });
     });
     eprintln!("sessions/attribution   {:.3}s", stage.elapsed().as_secs_f64());
     let stage = Instant::now();
     output::write(scratch, workers, &catalog)?;
-    eprintln!("write intermediate     {:.3}s", stage.elapsed().as_secs_f64());
+    eprintln!("write native Parquet   {:.3}s", stage.elapsed().as_secs_f64());
     Ok(())
 }
 

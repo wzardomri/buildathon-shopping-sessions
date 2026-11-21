@@ -30,6 +30,31 @@ fn packed(id: &[u8]) -> Option<u64> {
     Some(spread(u64::from_le_bytes(bytes) | case))
 }
 
+#[derive(Clone, Copy)]
+pub enum Name<'a> {
+    Packed(u64),
+    Full(&'a [u8]),
+}
+
+impl<'a> Name<'a> {
+    pub fn from_bytes(bytes: &'a [u8]) -> Self {
+        packed(bytes).map_or(Self::Full(bytes), Self::Packed)
+    }
+
+    pub fn is_empty(self) -> bool {
+        matches!(self, Self::Full(b""))
+    }
+}
+
+pub fn unpack(key: u64, out: &mut [u8; 9]) -> &[u8] {
+    let raw = spread(key); // The same fold reverses the encoding.
+    out[0] = if raw >> 63 == 0 { b'u' } else { b'U' };
+    let tail = raw & (u64::MAX >> 1);
+    out[1..].copy_from_slice(&tail.to_le_bytes());
+    let length = (64 - tail.leading_zeros()).div_ceil(8) as usize;
+    &out[..1 + length]
+}
+
 #[derive(Default)]
 struct Index<'a> {
     short: Map<u64, u32>,
@@ -96,7 +121,7 @@ impl<'a> Components<'a> {
 
 pub struct Identities<'a> {
     index: Index<'a>,
-    names: Vec<&'a [u8]>,
+    names: Vec<Name<'a>>,
 }
 
 impl<'a> Identities<'a> {
@@ -111,17 +136,18 @@ impl<'a> Identities<'a> {
         }
         let names = (0..groups.nodes.len()).map(|id| {
             let root = groups.root(id as u32);
-            groups.nodes[root as usize].name
+            Name::from_bytes(groups.nodes[root as usize].name)
         }).collect();
         Self { index: groups.index, names }
     }
 
     #[inline]
-    pub fn name(&self, key: &'a [u8]) -> &'a [u8] {
-        let id = match packed(key) {
-            Some(key) => self.index.short.get(&key),
-            None => self.index.other.get(key),
+    pub fn name(&self, key: &'a [u8]) -> Name<'a> {
+        let original = Name::from_bytes(key);
+        let id = match original {
+            Name::Packed(key) => self.index.short.get(&key),
+            Name::Full(key) => self.index.other.get(key),
         };
-        id.map_or(key, |&id| self.names[id as usize])
+        id.map_or(original, |&id| self.names[id as usize])
     }
 }
