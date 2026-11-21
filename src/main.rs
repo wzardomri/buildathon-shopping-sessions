@@ -1,8 +1,10 @@
+mod click;
 mod group;
 mod identities;
 mod input;
 mod output;
 
+use click::{Click, ClickRecord, PackedClick};
 use identities::{Identities, Name, unpack};
 use input::{DAY, IngestCalendar, Map, SHARDS, Table, WEEK, fields, find, first_field, hash_bytes, mix, shard, timestamp, transpose, unsigned, worker_map};
 use std::collections::hash_map::Entry;
@@ -129,15 +131,8 @@ impl EventRecord for PackedEvent {
 #[derive(Clone, Copy)]
 struct EventRow<'a, E> { user: Name<'a>, event: E }
 
-#[derive(Clone, Copy, Default)]
-struct Click<'a> {
-    at: i64,
-    id: &'a [u8],
-    campaign: u32,
-}
-
 #[derive(Clone, Copy)]
-struct ClickRow<'a> { user: Name<'a>, click: Click<'a> }
+struct ClickRow<'a, C> { user: Name<'a>, click: C }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Key<'a> { hash: u64, id: &'a [u8] }
@@ -445,24 +440,24 @@ fn load_events<'a, E: EventRecord>(
     group::batch(workers)
 }
 
-fn prepare_click<'a>(
-    line: &'a [u8], identities: &Identities<'a>, catalog: &Catalog<'a>, window: Window,
-) -> Option<(&'a [u8], ClickRow<'a>)> {
+fn prepare_click<'a, C: ClickRecord<'a>>(
+    line: &'a [u8], identities: &Identities<'a>, catalog: &Catalog<'a>, origin: i64, end: i64,
+) -> Option<(&'a [u8], ClickRow<'a, C>)> {
     let [id, user, campaign, at] = fields(line)?;
     if id.is_empty() || user.is_empty() { return None; }
     let campaign = *catalog.campaigns.get(campaign)?;
-    let at = timestamp(at).filter(|&at| at >= window.start - WEEK && at < window.end)?;
+    let at = timestamp(at).filter(|&at| at >= origin && at < end)?;
     let user = identities.name(user);
-    Some((id, ClickRow { user, click: Click { at, id, campaign } }))
+    Some((id, ClickRow { user, click: C::encode(Click { at, id, campaign }, origin) }))
 }
 
-fn load_clicks<'a>(
+fn load_clicks<'a, C: ClickRecord<'a>>(
     table: &'a Table, identities: &Identities<'a>, catalog: &Catalog<'a>,
-    window: Window, threads: usize,
-) -> Vec<group::Batch<'a, Click<'a>>> {
+    origin: i64, end: i64, threads: usize,
+) -> Vec<group::Batch<'a, C>> {
     let filter = DuplicateFilter::build(table, b'k', threads);
     let workers = table.scan(threads, Candidates::new, |worker, line| {
-        if let Some((id, row)) = prepare_click(line, identities, catalog, window) {
+        if let Some((id, row)) = prepare_click::<C>(line, identities, catalog, origin, end) {
             let key = ExactKey::new(id, b'k');
             let hash = key.fingerprint();
             let bucket = shard(hash);
@@ -484,7 +479,9 @@ fn load_clicks<'a>(
     group::batch(output)
 }
 
-fn select_clicks<'a, K: Hash + Eq>(parts: Vec<Vec<(K, ClickRow<'a>)>>, loaded: &mut group::Rows<'a, Click<'a>>) {
+fn select_clicks<'a, K: Hash + Eq, C>(
+    parts: Vec<Vec<(K, ClickRow<'a, C>)>>, loaded: &mut group::Rows<'a, C>,
+) {
     let count = parts.iter().map(Vec::len).sum::<usize>();
     let mut seen = Map::with_capacity_and_hasher(count, Default::default());
     // Duplicate click copies are identical. Filtering before this set is
@@ -595,18 +592,24 @@ impl Work {
         }
     }
 
-    fn process<E: EventRecord>(
-        &mut self, name: &[u8], events: &mut [E], clicks: &mut [Click<'_>], catalog: &Catalog<'_>, start_ms: i64,
+    fn process<'a, E: EventRecord, C: ClickRecord<'a>>(
+        &mut self,
+        name: &[u8],
+        events: &mut [E],
+        clicks: &mut [C],
+        catalog: &Catalog<'_>,
+        start_ms: i64,
+        click_origin: i64,
     ) {
         events.sort_unstable_by_key(|event| event.sort_key());
-        clicks.sort_unstable_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(b.id)));
+        clicks.sort_unstable_by(|a, b| a.sort_key().cmp(&b.sort_key()).then_with(|| a.id().cmp(b.id())));
         self.anchors.clear();
         let mut day_totals = UserDay {
             categories: std::mem::take(&mut self.categories),
             ..UserDay::default()
         };
         let mut cursor = 0;
-        let mut best: Option<Click<'_>> = None;
+        let mut best: Option<C> = None;
         let mut start = 0;
         let mut day = day_of(events[0].timestamp(start_ms));
         while start < events.len() {
@@ -636,13 +639,15 @@ impl Work {
             day_totals.sessions += 1;
             day_totals.events += (end - start) as u64;
             self.anchors.push(at);
-            while let Some(&click) = clicks.get(cursor).filter(|click| click.at <= at) {
-                if best.is_none_or(|before| click.at > before.at) {
+            let cutoff = C::time_key(at, click_origin);
+            while let Some(&click) = clicks.get(cursor).filter(|click| click.sort_key() <= cutoff) {
+                if best.is_none_or(|before| click.sort_key() > before.sort_key()) {
                     best = Some(click);
                 }
                 cursor += 1;
             }
-            let campaign = best.filter(|click| click.at >= at - WEEK).map_or(catalog.organic, |click| click.campaign);
+            let campaign = best.filter(|click| click.sort_key() >= cutoff - WEEK)
+                .map_or(catalog.organic, C::campaign);
             let total = self.totals.for_day(campaign, day);
             total.sessions += 1;
             total.purchasing += u64::from(revenue != 0);
@@ -652,7 +657,7 @@ impl Work {
         self.write_user_day(name, day, &day_totals);
         self.categories = day_totals.categories;
         self.categories.clear();
-        self.assists(&clicks[..cursor]);
+        self.assists(&clicks[..cursor], click_origin);
     }
 
     fn write_user_day(&mut self, name: &[u8], day: i32, totals: &UserDay) {
@@ -661,19 +666,21 @@ impl Work {
         self.users.push(name, day, totals.sessions, totals.events, totals.revenue, top);
     }
 
-    fn assists(&mut self, clicks: &[Click<'_>]) {
-        for click in clicks {
-            let campaign = click.campaign as usize;
-            let window = (click.at, click.at + WEEK);
-            match self.windows[campaign] {
-                Some((first, last)) if click.at <= last => self.windows[campaign] = Some((first, window.1)),
+    fn assists<'a, C: ClickRecord<'a>>(&mut self, clicks: &[C], origin: i64) {
+        for &click in clicks {
+            let campaign = click.campaign();
+            let index = campaign as usize;
+            let at = click.timestamp(origin);
+            let window = (at, at.saturating_add(WEEK));
+            match self.windows[index] {
+                Some((first, last)) if at <= last => self.windows[index] = Some((first, window.1)),
                 pending => {
                     if let Some((first, last)) = pending {
-                        count_assists(&self.anchors, &mut self.totals, click.campaign, first, last);
+                        count_assists(&self.anchors, &mut self.totals, campaign, first, last);
                     } else {
-                        self.seen.push(campaign);
+                        self.seen.push(index);
                     }
-                    self.windows[campaign] = Some(window);
+                    self.windows[index] = Some(window);
                 }
             }
         }
@@ -703,6 +710,8 @@ fn count_assists(
 fn solve(data: &Path, scratch: &Path, threads: usize) -> io::Result<()> {
     let stage = Instant::now();
     let window = Window::read(data)?;
+    let click_origin = window.start.checked_sub(WEEK)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "click window start overflows"))?;
     let links = Table::open(&data.join("links"))?;
     let products = Table::open(&data.join("products.csv"))?;
     let campaigns = Table::open(&data.join("campaigns.csv"))?;
@@ -711,20 +720,35 @@ fn solve(data: &Path, scratch: &Path, threads: usize) -> io::Result<()> {
     let identities = Identities::read(&links, threads);
     let catalog = Catalog::read(&products, &campaigns);
     eprintln!("load linked identities {:.3}s", stage.elapsed().as_secs_f64());
-    if PackedEvent::fits(window, catalog.categories.len()) {
-        solve_tables::<PackedEvent>(&events, &clicks, &identities, &catalog, window, scratch, threads)
+    let compact_clicks = PackedClick::fits(click_origin, window.end);
+    if compact_clicks && PackedEvent::fits(window, catalog.categories.len()) {
+        solve_tables::<PackedEvent, PackedClick<'_>>(
+            &events, &clicks, &identities, &catalog, window, click_origin, scratch, threads,
+        )
+    } else if compact_clicks {
+        solve_tables::<Event, PackedClick<'_>>(
+            &events, &clicks, &identities, &catalog, window, click_origin, scratch, threads,
+        )
     } else {
-        solve_tables::<Event>(&events, &clicks, &identities, &catalog, window, scratch, threads)
+        solve_tables::<Event, Click<'_>>(
+            &events, &clicks, &identities, &catalog, window, click_origin, scratch, threads,
+        )
     }
 }
 
-fn solve_tables<E: EventRecord>(
-    events: &Table, clicks: &Table, identities: &Identities<'_>, catalog: &Catalog<'_>,
-    window: Window, scratch: &Path, threads: usize,
+fn solve_tables<'a, E: EventRecord, C: ClickRecord<'a>>(
+    events: &'a Table,
+    clicks: &'a Table,
+    identities: &Identities<'a>,
+    catalog: &Catalog<'a>,
+    window: Window,
+    click_origin: i64,
+    scratch: &Path,
+    threads: usize,
 ) -> io::Result<()> {
     let events = load_events::<E>(events, identities, catalog, window, threads);
     let stage = Instant::now();
-    let clicks = load_clicks(clicks, identities, catalog, window, threads);
+    let clicks = load_clicks::<C>(clicks, identities, catalog, click_origin, window.end, threads);
     eprintln!("partition clicks       {:.3}s", stage.elapsed().as_secs_f64());
     let stage = Instant::now();
     let mut jobs: Vec<_> = events.into_iter().zip(clicks).map(Mutex::new).collect();
@@ -736,10 +760,10 @@ fn solve_tables<E: EventRecord>(
         let (events, clicks) = std::mem::take(&mut *jobs[job].lock().unwrap());
         let mut name = [0; 9];
         group::people(events.packed, clicks.packed, |key, events, clicks| {
-            work.process(unpack(key, &mut name), events, clicks, catalog, window.start);
+            work.process(unpack(key, &mut name), events, clicks, catalog, window.start, click_origin);
         });
         group::people(events.full, clicks.full, |name, events, clicks| {
-            work.process(name, events, clicks, catalog, window.start);
+            work.process(name, events, clicks, catalog, window.start, click_origin);
         });
     });
     eprintln!("sessions/attribution   {:.3}s", stage.elapsed().as_secs_f64());
