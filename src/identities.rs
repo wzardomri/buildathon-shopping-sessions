@@ -1,4 +1,5 @@
 use crate::input::{Map, SHARDS, Table, fields, hash_bytes, mix, shard, worker_map};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[inline]
@@ -38,6 +39,7 @@ pub enum Name<'a> {
 }
 
 impl<'a> Name<'a> {
+    #[cfg(test)]
     pub fn from_bytes(bytes: &'a [u8]) -> Self {
         packed(bytes).map_or(Self::Full(bytes), Self::Packed)
     }
@@ -186,9 +188,43 @@ impl Components<'_> {
     }
 }
 
+struct DirectShard<'a> {
+    packed: Map<u64, u64>,
+    packed_full: Map<u64, &'a [u8]>,
+    full: Map<&'a [u8], Name<'a>>,
+}
+
+impl<'a> DirectShard<'a> {
+    fn from_index(base: u32, index: Index<'a>, names: &[Name<'a>]) -> Self {
+        // Canonical spellings and singletons need no entry. Start with a
+        // smaller allocation and let unusual link shapes grow it as needed.
+        let mut packed = Map::with_capacity_and_hasher(index.short.len() / 2, Default::default());
+        let mut packed_full = Map::default();
+        let mut full = Map::default();
+        for (key, node) in index.short {
+            match names[(base + node) as usize] {
+                Name::Packed(owner) if owner == key => {}
+                Name::Packed(owner) => { packed.insert(key, owner); }
+                Name::Full(owner) => { packed_full.insert(key, owner); }
+            }
+        }
+        for (key, node) in index.other {
+            match names[(base + node) as usize] {
+                Name::Full(owner) if owner == key => {}
+                owner => { full.insert(key, owner); }
+            }
+        }
+        if packed.capacity() > packed.len().saturating_mul(2) {
+            packed.shrink_to_fit();
+        }
+        Self { packed, packed_full, full }
+    }
+}
+
 pub struct Identities<'a> {
-    indices: Vec<(u32, Index<'a>)>,
-    names: Vec<Name<'a>>,
+    packed: Vec<Map<u64, u64>>,
+    packed_full: Option<Vec<Map<u64, &'a [u8]>>>,
+    full: Vec<Map<&'a [u8], Name<'a>>>,
 }
 
 impl<'a> Identities<'a> {
@@ -240,33 +276,53 @@ impl<'a> Identities<'a> {
                 global_id(edge[1].load(Ordering::Relaxed)),
             );
         }
-        let names = (0..groups.parents.len()).map(|id| {
+        // Roots already hold the component's canonical spelling. Writing
+        // that spelling into a non-root slot does not change any root.
+        for id in 0..groups.parents.len() {
             let root = groups.root(id as u32) as usize;
-            groups.names[root]
-        }).collect();
-        Self { indices, names }
+            groups.names[id] = groups.names[root];
+        }
+        let Components { parents, sizes, names } = groups;
+        drop((assigned, parents, sizes));
+
+        let sources: Vec<_> = indices.into_iter().map(|item| Mutex::new(Some(item))).collect();
+        let mut shards: Vec<_> = worker_map(threads, sources.len(), Vec::new, |worker, bucket| {
+            let (base, index) = sources[bucket].lock().unwrap().take().unwrap();
+            worker.push((bucket, DirectShard::from_index(base, index, &names)));
+        }).into_iter().flatten().collect();
+        shards.sort_unstable_by_key(|(bucket, _)| *bucket);
+
+        let mut packed = Vec::with_capacity(shards.len());
+        let mut packed_full = Vec::with_capacity(shards.len());
+        let mut full = Vec::with_capacity(shards.len());
+        for (_, shard) in shards {
+            packed.push(shard.packed);
+            packed_full.push(shard.packed_full);
+            full.push(shard.full);
+        }
+        let packed_full = packed_full.iter().any(|map| !map.is_empty()).then_some(packed_full);
+        Self { packed, packed_full, full }
     }
 
     #[inline]
     pub fn name(&self, key: &'a [u8]) -> Name<'a> {
-        let original = Name::from_bytes(key);
-        let (base, local_id) = match original {
-            Name::Packed(key) => {
-                let (base, index) = &self.indices[packed_shard(key)];
-                (*base, index.short.get(&key))
+        if let Some(bits) = packed(key) {
+            let bucket = packed_shard(bits);
+            if let Some(&owner) = self.packed[bucket].get(&bits) {
+                return Name::Packed(owner);
             }
-            Name::Full(key) => {
-                let (base, index) = &self.indices[shard(hash_bytes(key))];
-                (*base, index.other.get(key))
+            if let Some(&owner) = self.packed_full.as_ref().and_then(|maps| maps[bucket].get(&bits)) {
+                return Name::Full(owner);
             }
-        };
-        local_id.map_or(original, |&id| self.names[(base + id) as usize])
+            return Name::Packed(bits);
+        }
+        self.full[shard(hash_bytes(key))].get(key).copied().unwrap_or(Name::Full(key))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Name, unpack};
+    use super::{DirectShard, Index, Name, packed, unpack};
 
     #[test]
     fn canonical_name_order_matches_bytes() {
@@ -297,5 +353,36 @@ mod tests {
                 assert_eq!(actual, left.min(right));
             }
         }
+    }
+
+    #[test]
+    fn only_changed_aliases_are_stored() {
+        let unchanged = packed(b"ua").unwrap();
+        let renamed = packed(b"ub").unwrap();
+        let renamed_to_full = packed(b"uc").unwrap();
+        let mut index = Index::default();
+        index.short.insert(unchanged, 0);
+        index.short.insert(renamed, 1);
+        index.short.insert(renamed_to_full, 2);
+        index.other.insert(b"same", 3);
+        index.other.insert(b"renamed-long", 4);
+        index.other.insert(b"alias", 5);
+        let names = [
+            Name::Full(b"slot from earlier shard"),
+            Name::Packed(unchanged),
+            Name::Packed(unchanged),
+            Name::Full(b"A long canonical spelling"),
+            Name::Full(b"same"),
+            Name::Packed(unchanged),
+            Name::Full(b"A long canonical spelling"),
+        ];
+        let aliases = DirectShard::from_index(1, index, &names);
+        assert_eq!(aliases.packed.len(), 1);
+        assert_eq!(aliases.packed.get(&renamed), Some(&unchanged));
+        assert_eq!(aliases.packed_full.len(), 1);
+        assert_eq!(aliases.packed_full.get(&renamed_to_full).copied(), Some(b"A long canonical spelling".as_slice()));
+        assert_eq!(aliases.full.len(), 2);
+        assert!(matches!(aliases.full.get(b"renamed-long".as_slice()), Some(Name::Packed(owner)) if *owner == unchanged));
+        assert!(matches!(aliases.full.get(b"alias".as_slice()), Some(Name::Full(b"A long canonical spelling"))));
     }
 }
