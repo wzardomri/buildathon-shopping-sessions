@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 const SESSION_GAP: i64 = 30 * 60_000;
+const MAX_PRICE: i64 = 10_000_000;
 
 #[derive(Clone, Copy)]
 struct Window { start: i64, end: i64 }
@@ -76,8 +77,57 @@ struct Event {
     category: u32,
 }
 
+trait EventRecord: Copy + Default + Send {
+    fn encode(event: Event, start: i64) -> Self;
+    fn sort_key(self) -> i64;
+    fn timestamp(self, start: i64) -> i64;
+    fn purchase(self) -> (u32, u32);
+}
+
+impl EventRecord for Event {
+    fn encode(event: Event, _: i64) -> Self { event }
+    fn sort_key(self) -> i64 { self.at }
+    fn timestamp(self, _: i64) -> i64 { self.at }
+    fn purchase(self) -> (u32, u32) { (self.price, self.category) }
+}
+
+#[derive(Clone, Copy, Default)]
+struct PackedEvent(u64);
+
+impl PackedEvent {
+    const PRICE_BITS: u32 = 24;
+    const CATEGORY_BITS: u32 = 9;
+    const TIME_SHIFT: u32 = Self::PRICE_BITS + Self::CATEGORY_BITS;
+    const PRICE_MASK: u64 = (1 << Self::PRICE_BITS) - 1;
+    const CATEGORY_MASK: u64 = (1 << Self::CATEGORY_BITS) - 1;
+    const MAX_DURATION: i64 = 1 << (64 - Self::TIME_SHIFT);
+
+    fn fits(window: Window, categories: usize) -> bool {
+        // Events at the end of the window are excluded. A duration of 2^31
+        // therefore has a maximum event offset of 2^31 - 1.
+        window.end.checked_sub(window.start).is_some_and(|duration| duration <= Self::MAX_DURATION)
+            && MAX_PRICE as u64 <= Self::PRICE_MASK
+            && categories <= 1 << Self::CATEGORY_BITS
+    }
+}
+
+impl EventRecord for PackedEvent {
+    fn encode(event: Event, start: i64) -> Self {
+        Self(((event.at - start) as u64) << Self::TIME_SHIFT
+            | u64::from(event.category) << Self::PRICE_BITS
+            | u64::from(event.price))
+    }
+
+    fn sort_key(self) -> i64 { (self.0 >> Self::TIME_SHIFT) as i64 }
+    fn timestamp(self, start: i64) -> i64 { start + self.sort_key() }
+
+    fn purchase(self) -> (u32, u32) {
+        ((self.0 & Self::PRICE_MASK) as u32, ((self.0 >> Self::PRICE_BITS) & Self::CATEGORY_MASK) as u32)
+    }
+}
+
 #[derive(Clone, Copy)]
-struct EventRow<'a> { user: Name<'a>, event: Event }
+struct EventRow<'a, E> { user: Name<'a>, event: E }
 
 #[derive(Clone, Copy, Default)]
 struct Click<'a> {
@@ -100,7 +150,7 @@ impl Hash for Key<'_> {
     fn hash<H: Hasher>(&self, hasher: &mut H) { hasher.write_u64(self.hash); }
 }
 
-struct EarlyCopy<'a> { ingest: i64, row: EventRow<'a> }
+struct EarlyCopy<'a, E> { ingest: i64, row: EventRow<'a, E> }
 
 // A table-specific prefix followed by at most eight bytes fits losslessly into
 // u64. Trailing NUL values use the fallback since zero is the padding byte.
@@ -219,41 +269,41 @@ impl DuplicateFilter {
     }
 }
 
-fn prepare_event<'a>(
+fn prepare_event<'a, E: EventRecord>(
     line: &'a [u8], identities: &Identities<'a>, catalog: &Catalog<'a>, window: Window,
-) -> Option<(&'a [u8], EarlyCopy<'a>)> {
+) -> Option<(&'a [u8], EarlyCopy<'a, E>)> {
     let [id, user, at, ingest, kind, product, price] = fields(line)?;
     if id.is_empty() { return None; }
     let ingest = timestamp(ingest)?;
     // Invalid copies remain in the dedup stage as tombstones. In particular,
     // a valid later copy must never rescue an invalid earliest copy.
     let row = prepare_event_row(user, at, ingest, kind, product, price, identities, catalog, window)
-        .unwrap_or(EventRow { user: Name::Full(b""), event: Event::default() });
+        .unwrap_or(EventRow { user: Name::Full(b""), event: E::default() });
     Some((id, EarlyCopy { ingest, row }))
 }
 
-fn prepare_event_row<'a>(
+fn prepare_event_row<'a, E: EventRecord>(
     user: &'a [u8], at: &[u8], ingest: i64, kind: &[u8], product: &[u8], price: &[u8],
     identities: &Identities<'a>, catalog: &Catalog<'a>, window: Window,
-) -> Option<EventRow<'a>> {
+) -> Option<EventRow<'a, E>> {
     if user.is_empty() || product.is_empty() || !matches!(kind, b"purchase" | b"cart" | b"view") {
         return None;
     }
     let at = timestamp(at).filter(|&at| at >= window.start && at < window.end && ingest - at <= DAY)?;
     let (price, category) = if kind == b"purchase" {
-        let price = unsigned(price).filter(|&value| (1..=10_000_000).contains(&value))?;
+        let price = unsigned(price).filter(|&value| (1..=MAX_PRICE).contains(&value))?;
         let category = catalog.products.get(product).copied().unwrap_or(catalog.unknown);
         (price as u32, category)
     } else {
         (0, 0)
     };
-    Some(EventRow { user: identities.name(user), event: Event { at, price, category } })
+    Some(EventRow { user: identities.name(user), event: E::encode(Event { at, price, category }, window.start) })
 }
 
-fn load_events<'a>(
+fn load_events<'a, E: EventRecord>(
     table: &'a Table, identities: &Identities<'a>, catalog: &Catalog<'a>,
     window: Window, threads: usize,
-) -> Vec<group::Batch<'a, Event>> {
+) -> Vec<group::Batch<'a, E>> {
     let stage = Instant::now();
     let filter = DuplicateFilter::build(table, b'e', threads);
     eprintln!("event duplicate filter {:.3}s", stage.elapsed().as_secs_f64());
@@ -285,7 +335,9 @@ fn load_events<'a>(
     group::batch(output)
 }
 
-fn select_events<'a, K: Hash + Eq + Copy>(parts: Vec<Vec<(K, EarlyCopy<'a>)>>, loaded: &mut group::Rows<'a, Event>) {
+fn select_events<'a, K: Hash + Eq + Copy, E: Copy>(
+    parts: Vec<Vec<(K, EarlyCopy<'a, E>)>>, loaded: &mut group::Rows<'a, E>,
+) {
     let count = parts.iter().map(Vec::len).sum::<usize>();
     let mut winners = Map::with_capacity_and_hasher(count, Default::default());
     for (key, candidate) in parts.iter().flatten() {
@@ -453,8 +505,10 @@ impl Work {
         }
     }
 
-    fn process(&mut self, name: &[u8], events: &mut [Event], clicks: &mut [Click<'_>], catalog: &Catalog<'_>) {
-        events.sort_unstable_by_key(|event| event.at);
+    fn process<E: EventRecord>(
+        &mut self, name: &[u8], events: &mut [E], clicks: &mut [Click<'_>], catalog: &Catalog<'_>, start_ms: i64,
+    ) {
+        events.sort_unstable_by_key(|event| event.sort_key());
         clicks.sort_unstable_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(b.id)));
         self.anchors.clear();
         let mut day_totals = UserDay {
@@ -464,9 +518,9 @@ impl Work {
         let mut cursor = 0;
         let mut best: Option<Click<'_>> = None;
         let mut start = 0;
-        let mut day = day_of(events[0].at);
+        let mut day = day_of(events[0].timestamp(start_ms));
         while start < events.len() {
-            let at = events[start].at;
+            let at = events[start].timestamp(start_ms);
             let session_day = day_of(at);
             if day != session_day {
                 self.write_user_day(name, day, &day_totals);
@@ -477,15 +531,16 @@ impl Work {
                 day = session_day;
             }
             let mut end = start + 1;
-            while end < events.len() && events[end].at - events[end - 1].at <= SESSION_GAP {
+            while end < events.len() && events[end].sort_key() - events[end - 1].sort_key() <= SESSION_GAP {
                 end += 1;
             }
             let mut revenue = 0;
             for event in &events[start..end] {
-                if event.price != 0 {
-                    let price = u64::from(event.price);
+                let (price, category) = event.purchase();
+                if price != 0 {
+                    let price = u64::from(price);
                     revenue += price;
-                    day_totals.purchase(event.category, price);
+                    day_totals.purchase(category, price);
                 }
             }
             day_totals.sessions += 1;
@@ -566,9 +621,20 @@ fn solve(data: &Path, scratch: &Path, threads: usize) -> io::Result<()> {
     let identities = Identities::read(&links);
     let catalog = Catalog::read(&products, &campaigns);
     eprintln!("load linked identities {:.3}s", stage.elapsed().as_secs_f64());
-    let events = load_events(&events, &identities, &catalog, window, threads);
+    if PackedEvent::fits(window, catalog.categories.len()) {
+        solve_tables::<PackedEvent>(&events, &clicks, &identities, &catalog, window, scratch, threads)
+    } else {
+        solve_tables::<Event>(&events, &clicks, &identities, &catalog, window, scratch, threads)
+    }
+}
+
+fn solve_tables<E: EventRecord>(
+    events: &Table, clicks: &Table, identities: &Identities<'_>, catalog: &Catalog<'_>,
+    window: Window, scratch: &Path, threads: usize,
+) -> io::Result<()> {
+    let events = load_events::<E>(events, identities, catalog, window, threads);
     let stage = Instant::now();
-    let clicks = load_clicks(&clicks, &identities, &catalog, window, threads);
+    let clicks = load_clicks(clicks, identities, catalog, window, threads);
     eprintln!("partition clicks       {:.3}s", stage.elapsed().as_secs_f64());
     let stage = Instant::now();
     let mut jobs: Vec<_> = events.into_iter().zip(clicks).map(Mutex::new).collect();
@@ -580,15 +646,15 @@ fn solve(data: &Path, scratch: &Path, threads: usize) -> io::Result<()> {
         let (events, clicks) = std::mem::take(&mut *jobs[job].lock().unwrap());
         let mut name = [0; 9];
         group::people(events.packed, clicks.packed, |key, events, clicks| {
-            work.process(unpack(key, &mut name), events, clicks, &catalog);
+            work.process(unpack(key, &mut name), events, clicks, catalog, window.start);
         });
         group::people(events.full, clicks.full, |name, events, clicks| {
-            work.process(name, events, clicks, &catalog);
+            work.process(name, events, clicks, catalog, window.start);
         });
     });
     eprintln!("sessions/attribution   {:.3}s", stage.elapsed().as_secs_f64());
     let stage = Instant::now();
-    output::write(scratch, workers, &catalog)?;
+    output::write(scratch, workers, catalog)?;
     eprintln!("write native Parquet   {:.3}s", stage.elapsed().as_secs_f64());
     Ok(())
 }
