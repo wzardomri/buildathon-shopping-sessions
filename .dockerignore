@@ -1,5 +1,2 @@
-target
 .git
-__pycache__
-cargo-cache
-verify-*
+**/target
