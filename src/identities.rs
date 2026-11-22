@@ -359,7 +359,8 @@ impl<'a> Identities<'a> {
     }
 
     #[inline]
-    pub fn canonical(&self, raw: Name<'a>) -> Name<'a> {
+    pub fn canonical<'view>(&self, raw: Name<'view>) -> Name<'view>
+    where 'a: 'view {
         let bucket = raw.shard();
         match raw {
             Name::Packed(bits) => {
@@ -371,7 +372,10 @@ impl<'a> Identities<'a> {
                 }
                 raw
             }
-            Name::Full(key) => self.full[bucket].get(key).copied().unwrap_or(raw),
+            Name::Full(key) => match self.full[bucket].get(key) {
+                Some(&owner) => owner,
+                None => raw,
+            },
         }
     }
 }

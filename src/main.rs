@@ -1,10 +1,13 @@
 mod click;
 mod group;
 mod identities;
+mod inline_owner;
 mod input;
 mod output;
 #[cfg(test)]
 mod reducer_tests;
+#[cfg(test)]
+mod inline_owner_tests;
 
 use click::{Click, ClickRecord, PackedClick};
 use identities::{Identities, Name, unpack};
@@ -310,6 +313,7 @@ impl<'a, E: EventRecord> FusedEventBatch<'a, E> {
         // The 4 MiB ordinary and 16 MiB cold plans both have at most
         // CHUNK_BYTES admitted candidates plus one row spanning the end.
         self.candidates <= group::MAX_LOCATED_ROWS - CHUNK_BYTES - 1
+            && self.output.accepts_full_chunk()
     }
 
     fn scan(
@@ -537,11 +541,17 @@ fn load_events<'a, E: EventRecord>(
         batches.last_mut().unwrap().scan(chunks[index], catalog, window, &calendar);
     });
     eprintln!("fused event scan       {:.3}s", stage.elapsed().as_secs_f64());
+    resolve_event_batches(workers.into_iter().flatten(), threads)
+}
+
+fn resolve_event_batches<'a, E: EventRecord>(
+    batches: impl IntoIterator<Item = FusedEventBatch<'a, E>>, threads: usize,
+) -> Vec<group::Batch<'a, E>> {
     let stage = Instant::now();
     let mut wide = Vec::new();
     let mut output = Vec::new();
     let mut jobs: Vec<_> = (0..WINNER_SHARDS).map(|_| Mutex::new((Vec::new(), Vec::new()))).collect();
-    for FusedEventBatch { packed, full, wide_ingests, output: rows, .. } in workers.into_iter().flatten() {
+    for FusedEventBatch { packed, full, wide_ingests, output: rows, .. } in batches {
         let batch = u32::try_from(wide.len()).expect("too many event batches");
         wide.push(wide_ingests);
         output.push((rows, Vec::new()));
@@ -899,6 +909,7 @@ fn solve_tables<'a, E: EventRecord, C: ClickRecord<'a>>(
         arenas.push((
             group::RawPeople::gather(events.packed, clicks.packed),
             group::RawPeople::gather(events.full, clicks.full),
+            group::RawPeople::gather(events.inline, clicks.inline).decode_owners(),
         ));
     }).into_iter().flatten().collect();
     eprintln!("group raw names        {:.3}s", stage.elapsed().as_secs_f64());
@@ -908,10 +919,11 @@ fn solve_tables<'a, E: EventRecord, C: ClickRecord<'a>>(
     // names because another spelling of the same person may have the events.
     let sources: Vec<_> = arenas.iter_mut().map(|arena| Mutex::new(Some(arena))).collect();
     let routes = worker_map(threads, sources.len(), buckets, |routes, source| {
-        let (packed, full) = sources[source].lock().unwrap().take().unwrap();
+        let (packed, full, inline) = sources[source].lock().unwrap().take().unwrap();
         let packed = packed.slabs().map(|(key, events, clicks)| (Name::Packed(key), events, clicks));
         let full = full.slabs().map(|(key, events, clicks)| (Name::Full(key), events, clicks));
-        for (raw, events, clicks) in packed.chain(full) {
+        let inline = inline.borrowed_slabs().map(|(key, events, clicks)| (Name::Full(&key[..]), events, clicks));
+        for (raw, events, clicks) in packed.chain(full).chain(inline) {
             let owner = identities.canonical(raw);
             routes[owner.shard()].push(group::Slab { owner, events, clicks });
         }
