@@ -4,6 +4,7 @@ mod identities;
 mod inline_owner;
 mod input;
 mod output;
+mod winner_table;
 #[cfg(test)]
 mod reducer_tests;
 #[cfg(test)]
@@ -561,12 +562,21 @@ fn resolve_event_batches<'a, E: EventRecord>(
             if !full.is_empty() { full_parts.push((batch, full)); }
         }
     }
-    let losers = worker_map(threads, jobs.len(), || (Vec::new(), Vec::new()), |(losers, table), index| {
-        let (packed, full) = std::mem::take(&mut *jobs[index].lock().unwrap());
-        mark_packed_losers(packed, &wide, table, losers);
-        mark_fused_losers(full, &wide, |key| key.hash, losers);
-    });
-    for (batch, location) in losers.into_iter().flat_map(|(losers, _)| losers) {
+    let losers = worker_map(
+        threads,
+        jobs.len(),
+        || (Vec::new(), Vec::new(), winner_table::Tape::default()),
+        |(losers, table, tape), index| {
+            let (packed, full) = std::mem::take(&mut *jobs[index].lock().unwrap());
+            if winner_table::try_large(&packed, &wide, table, tape, losers) {
+                drop(packed);
+            } else {
+                mark_packed_losers(packed, &wide, table, losers);
+            }
+            mark_fused_losers(full, &wide, |key| key.hash, losers);
+        },
+    );
+    for (batch, location) in losers.into_iter().flat_map(|(losers, _, _)| losers) {
         output[batch as usize].1.push(location);
     }
     let output: Vec<_> = output.into_iter().map(|batch| Mutex::new(Some(batch))).collect();
