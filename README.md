@@ -20,4 +20,5 @@ The fixture runner in the official starter can run the image with the scorer's o
 - [Builders' published rules and fixtures](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md?inline=1) specify the input and output.
 - The calendar arithmetic follows Howard Hinnant's [civil date algorithms](https://howardhinnant.github.io/date_algorithms.html).
 - The byte-hash mixing step is based on [FxHash](https://github.com/rust-lang/rustc-hash).
-- The Rust core uses the standard library and the platform C library. The writers use [Apache Parquet 54.3.1](https://docs.rs/parquet/54.3.1/parquet/) and [Bytes 1.10.1](https://docs.rs/bytes/1.10.1/bytes/). Their dependencies are pinned in `Cargo.lock`.
+- The Rust core uses the standard library and the platform C library. The writers use [Apache Parquet 54.3.1](https://docs.rs/parquet/54.3.1/parquet/), [Bytes 1.10.1](https://docs.rs/bytes/1.10.1/bytes/), and Snap 1.1.2 for Snappy compression. Their dependencies are pinned in `Cargo.lock`.
+- The inline owner fingerprint uses the first two [XXH64 primes](https://github.com/Cyan4973/xxHash/blob/v0.8.3/xxhash.h).
